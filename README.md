@@ -24,7 +24,7 @@ post-training. Optimized for single-GPU training with **bf16**, **torch.compile*
 
 ```bash
 # Clone and cd
-git clone <your-repo-url> && cd MODEL
+git clone https://github.com/OEvortex/VORTEX-110M.git && cd VORTEX-110M
 
 # Create env
 python -m venv .venv
@@ -44,7 +44,7 @@ pip install distill-kit
 
 ## Quick start: pretrain
 
-The simplest run pulls data shards automatically from the Hub (`Niansuh1/vortex-110m-data`).
+The simplest run pulls data shards automatically from the Hub (`VTXAI/vortex-110m-data`).
 
 ```bash
 # Run from inside src/
@@ -65,7 +65,7 @@ python pretrain.py \
   --block 2048 \
   --compile \
   --save-dir /tmp/vortex_ckpt \
-  --hub-repo Niansuh1/vortex-110m \
+  --hub-repo VTXAI/vortex-110m \
   --push-every 1500 \
   --log-every 25
 ```
@@ -74,7 +74,7 @@ python pretrain.py \
 
 Two options:
 
-1. **AUTO (default)** — downloads `.bin` shards from `Niansuh1/vortex-110m-data`
+1. **AUTO (default)** — downloads `.bin` shards from `VTXAI/vortex-110m-data`
    on the Hub. Just use `--shards AUTO` or omit the flag entirely.
 2. **Local shards** — point to pre-tokenized `uint32` memmap files:
 
@@ -99,7 +99,7 @@ python pretrain.py --shards /data/shard_0000.bin /data/shard_0001.bin
   "block": 2048,              // Sequence length
   "seed": 42,
   "shards": "AUTO",           // "AUTO" or list of .bin paths
-  "hub_repo": "Niansuh1/vortex-110m",
+  "hub_repo": "VTXAI/vortex-110m",
   "push_every": 1500,         // Push checkpoint every N steps
   "log_every": 25,
   "save_dir": "/tmp/vortex_ckpt",
@@ -115,7 +115,7 @@ Tokens per step = `effective_batch * block`.
 Set these env vars to log to a HF Space:
 
 ```bash
-export TRACKIO_SPACE_ID="Niansuh1/vortex-110m-trackio"
+export TRACKIO_SPACE_ID="VTXAI/vortex-110m-trackio"
 export TRACKIO_PROJECT="vortex-110m"
 ```
 
@@ -133,17 +133,17 @@ python distill.py
 This launches Arcee AI's **DistillKit** with `distill_config.yml`:
 
 - **Teacher**: `arcee-ai/Qwen3-235B-Logits-Packed-8192` (prepacked logits)
-- **Student**: `Niansuh1/vortex-110m`
+- **Student**: `VTXAI/vortex-110m`
 - **Loss**: `0.5 * cross_entropy + 0.5 * KL` at temperature=1.0
-- **Output**: `Niansuh1/vortex-110m-distilled`
+- **Output**: `VTXAI/vortex-110m-distilled`
 
 Override defaults:
 
 ```bash
 python distill.py \
-  --student-ckpt Niansuh1/vortex-110m \
+  --student-ckpt VTXAI/vortex-110m \
   --distill-config distill_config.yml \
-  --out Niansuh1/vortex-110m-distilled \
+  --out VTXAI/vortex-110m-distilled \
   --steps 8000 \
   --lr 2e-5 \
   --batch 2 \
@@ -155,7 +155,7 @@ python distill.py \
 
 ```bash
 python eval_benchmarks.py \
-  --ckpt Niansuh1/vortex-110m \
+  --ckpt VTXAI/vortex-110m \
   --tokenizer Qwen/Qwen3-4B \
   --tasks hellaswag arc_easy arc_challenge piqa winogrande \
   --batch 8 \

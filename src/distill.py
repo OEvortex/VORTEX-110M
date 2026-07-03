@@ -20,10 +20,10 @@ from pathlib import Path
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--student-ckpt", default="Niansuh1/vortex-110m",
+    p.add_argument("--student-ckpt", default="VTXAI/vortex-110m",
                    help="HF repo id or local path of the student Vortex-110M")
     p.add_argument("--distill-config", default="distill_config.yml")
-    p.add_argument("--out", default="Niansuh1/vortex-110m-distilled")
+    p.add_argument("--out", default="VTXAI/vortex-110m-distilled")
     p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--batch", type=int, default=2)

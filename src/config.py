@@ -56,9 +56,9 @@ class VortexArch:
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class HubConfig:
-    model_repo: str = "Niansuh1/vortex-110m"
-    data_repo: str = "Niansuh1/vortex-110m-data"
-    trackio_space_id: str = "Niansuh1/vortex-110m-trackio"
+    model_repo: str = "VTXAI/vortex-110m"
+    data_repo: str = "VTXAI/vortex-110m-data"
+    trackio_space_id: str = "VTXAI/vortex-110m-trackio"
     trackio_project: str = "vortex-110m"
 
     def __post_init__(self):

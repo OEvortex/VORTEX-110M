@@ -63,8 +63,8 @@ def parse_args():
 DEFAULTS = dict(
     steps=40000, warmup=1000, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
     beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=8,
-    block=2048, seed=42, shards=None, hub_repo="Niansuh1/vortex-110m",
-    trackio_space="Niansuh1/vortex-110m-trackio", trackio_project="vortex-110m",
+    block=2048, seed=42, shards=None, hub_repo="VTXAI/vortex-110m",
+    trackio_space="VTXAI/vortex-110m-trackio", trackio_project="vortex-110m",
     push_every=2000, log_every=20, save_dir="/tmp/vortex_ckpt", compile=True,
 )
 
@@ -99,7 +99,7 @@ def get_default_shards():
     from huggingface_hub import snapshot_download
     print("[pretrain] downloading data shards from Hub...", flush=True)
     local_data = snapshot_download(
-        repo_id="Niansuh1/vortex-110m-data",
+        repo_id="VTXAI/vortex-110m-data",
         repo_type="dataset",
         allow_patterns=["data/*.bin"],
     )
