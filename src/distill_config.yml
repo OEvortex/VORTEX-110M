@@ -1,0 +1,71 @@
+# Vortex-110M Distillation Configuration
+#
+# Use with Arcee AI's DistillKit:
+#   pip install distill-kit
+#   distill-run --config distill_config.yml
+#
+# Source: https://github.com/arcee-ai/DistillKit
+# Dataset: arcee-ai/Qwen3-235B-Logits-Packed-8192
+# Student: Niansuh1/vortex-110m (after pretraining)
+
+student:
+  kind: "model"
+  name_or_path: "Niansuh1/vortex-110m"
+  dtype: "bfloat16"
+  attn_implementation: "sdpa"
+  trust_remote_code: true
+
+teacher:
+  kind: "dataset"
+  name_or_path: "arcee-ai/Qwen3-235B-Logits-Packed-8192"
+  prepacked: true
+  sequence_length: 8192
+  logprob_compressor:
+    # d must match student vocab size; for Vortex-110M this is 151643
+    # (override if you change the tokenizer)
+    d: 151643
+    k: 128
+    exact_k: 32
+    exact_dtype: "float32"
+    polynomial_terms: [0, 1, 2]
+    delta_encoding: true
+    error_diffusion: false
+
+data:
+  dataset_name: "arcee-ai/Qwen3-235B-Logits-Packed-8192"
+  text_field: "text"
+  max_seq_length: 8192
+  packing: true
+  preprocessing_num_workers: 8
+
+training:
+  output_dir: "./vortex-110m-distilled"
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 16
+  num_train_epochs: 1
+  max_steps: -1
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  warmup_steps: 200
+  lr_scheduler_type: "cosine"
+  bf16: true
+  gradient_checkpointing: true
+  optim: "adamw_torch_fused"
+  logging_steps: 20
+  save_strategy: "steps"
+  save_steps: 1000
+  save_total_limit: 3
+  report_to: ["trackio"]
+  trackio_project: "vortex-110m-distill"
+  trackio_space_id: "Niansuh1/vortex-110m-trackio"
+  push_to_hub: true
+  hub_model_id: "Niansuh1/vortex-110m-distilled"
+  hub_strategy: "every_save"
+
+distillation:
+  temperature: 1.0
+  losses:
+    - name: "cross_entropy"
+      weight: 0.5
+    - name: "kl"
+      weight: 0.5

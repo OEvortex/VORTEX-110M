@@ -1,0 +1,22 @@
+{
+  "steps": 30000,
+  "warmup": 1000,
+  "lr": 6e-4,
+  "min_lr": 6e-5,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "grad_clip": 1.0,
+  "batch": 16,
+  "grad_accum": 4,
+  "block": 2048,
+  "seed": 42,
+  "shards": "AUTO",
+  "hub_repo": "Niansuh1/vortex-110m",
+  "trackio_space": "Niansuh1/vortex-110m-trackio",
+  "trackio_project": "vortex-110m",
+  "push_every": 1500,
+  "log_every": 25,
+  "save_dir": "/tmp/vortex_ckpt",
+  "compile": true
+}
