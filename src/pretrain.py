@@ -61,11 +61,11 @@ def parse_args():
 
 
 DEFAULTS = dict(
-    steps=40000, warmup=1000, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
-    beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=8,
-    block=2048, seed=42, shards=None, hub_repo="VTXAI/vortex-110m",
+    steps=40000, warmup=1000, lr=1.2e-3, min_lr=1.2e-4, weight_decay=0.1,
+    beta1=0.9, beta2=0.95, grad_clip=1.0, batch=64, grad_accum=2,
+    block=8192, seed=42, shards=None, hub_repo="VTXAI/vortex-110m",
     trackio_space="VTXAI/vortex-110m-trackio", trackio_project="vortex-110m",
-    push_every=2000, log_every=20, save_dir="/tmp/vortex_ckpt", compile=True,
+    push_every=3000, log_every=20, save_dir="/tmp/vortex_ckpt", compile=True,
 )
 
 
@@ -139,8 +139,8 @@ def main():
         return x[:, :-1], x[:, 1:]
 
     loader = DataLoader(
-        ds, batch_size=args.batch, num_workers=2, pin_memory=True,
-        collate_fn=collate, persistent_workers=True,
+        ds, batch_size=args.batch, num_workers=8, pin_memory=True,
+        collate_fn=collate, persistent_workers=True, prefetch_factor=4,
     )
     it = iter(loader)
 

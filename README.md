@@ -16,10 +16,10 @@ post-training. Optimized for single-GPU training with **bf16**, **torch.compile*
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU with **Blackwell (RTX 50xx / RTX PRO 50xx)** or **Ampere+** for SDPA + bf16
+- NVIDIA GPU with **Blackwell (RTX PRO 6000 / RTX 50xx)** or **Ampere+** for SDPA + bf16
 - CUDA 12.x
 - **VRAM guide**:
-  - ~80GB VRAM for the default 2k config (A100-80GB, batch=8, grad_accum=8)
+  - ~96GB VRAM for the recommended 8k config on RTX PRO 6000 (batch=64, grad_accum=2)
   - ~32GB VRAM for 8k context on RTX 5090 (batch=2, grad_accum=8)
 
 ## Install
@@ -57,19 +57,19 @@ python pretrain.py --config pretrain_config.json
 Or override everything from the CLI:
 
 ```bash
-# Default 2k context (fits on 40GB+ GPUs)
+# Recommended 8k config on RTX PRO 6000 (96GB VRAM)
 python pretrain.py \
   --steps 30000 \
   --warmup 1000 \
-  --lr 6e-4 \
-  --min-lr 6e-5 \
-  --batch 16 \
-  --grad-accum 4 \
-  --block 2048 \
+  --lr 1.2e-3 \
+  --min-lr 1.2e-4 \
+  --batch 64 \
+  --grad-accum 2 \
+  --block 8192 \
   --compile \
   --save-dir /tmp/vortex_ckpt \
   --hub-repo VTXAI/vortex-110m \
-  --push-every 1500 \
+  --push-every 3000 \
   --log-every 25
 ```
 
@@ -108,19 +108,19 @@ python pretrain.py --shards /data/shard_0000.bin /data/shard_0001.bin
 {
   "steps": 30000,             // Total training steps
   "warmup": 1000,             // LR warmup steps
-  "lr": 6e-4,                 // Peak learning rate
-  "min_lr": 6e-5,             // Cosine LR floor
+  "lr": 1.2e-3,               // Peak learning rate (scaled for large batch)
+  "min_lr": 1.2e-4,           // Cosine LR floor
   "weight_decay": 0.1,
   "beta1": 0.9,
   "beta2": 0.95,
   "grad_clip": 1.0,           // Max gradient norm
-  "batch": 16,                // Per-device batch size
-  "grad_accum": 4,            // Gradient accumulation steps
-  "block": 2048,              // Sequence length
+  "batch": 64,                // Per-device batch size
+  "grad_accum": 2,            // Gradient accumulation steps
+  "block": 8192,              // Sequence length
   "seed": 42,
   "shards": "AUTO",           // "AUTO" or list of .bin paths
   "hub_repo": "VTXAI/vortex-110m",
-  "push_every": 1500,         // Push checkpoint every N steps
+  "push_every": 3000,         // Push checkpoint every N steps
   "log_every": 25,
   "save_dir": "/tmp/vortex_ckpt",
   "compile": true             // torch.compile (mode=default)
@@ -184,11 +184,14 @@ python eval_benchmarks.py \
 
 ## GPU tips
 
-- **2k context (default)**: on A100-80GB, `batch=8, grad_accum=8` is the starting point.
-- **8k context**: on RTX 5090 (32GB GDDR7, Blackwell, 5th-gen Tensor Cores), use
-  `batch=2, grad_accum=8`. If you OOM, drop `--batch` to 1 and raise `--grad-accum` to 16.
+- **8k context (recommended)**: on RTX PRO 6000 (96GB GDDR7, Blackwell), use
+  `batch=64, grad_accum=2`. This is the new default and gives the highest throughput.
+- **8k context on RTX 5090 (32GB)**: use `batch=2, grad_accum=8`. If you OOM, drop
+  `--batch` to 1 and raise `--grad-accum` to 16.
 - **Sequence length**: longer `--block` means more VRAM per sample. Activations scale
   linearly with sequence length; the 111M model itself is tiny (~2GB in bf16).
+- **Data pipeline**: default uses 8 DataLoader workers + prefetch=4 to keep Blackwell's
+  24,064 CUDA cores fed. Increase `--num_workers` only if your CPU stalls.
 - **Compile**: `--compile` cuts wall-time but increases peak memory slightly. If OOM,
   try disabling it.
 - **Precision**: training runs in `bf16` via `torch.amp.autocast("cuda", dtype=torch.bfloat16)`.
