@@ -18,7 +18,9 @@ post-training. Optimized for single-GPU training with **bf16**, **torch.compile*
 - Python 3.10+
 - NVIDIA GPU with **Ampere+ (A100 / RTX 30xx+)** for FlashAttention-2 + bf16
 - CUDA 11.8+ / 12.x
-- ~80GB VRAM for the default pretraining config (batch=8, block=2048)
+- **VRAM guide**:
+  - ~80GB VRAM for the default config (batch=8, block=2048)
+  - ~32GB VRAM for 8k context on RTX 5090 / similar (batch=2, grad_accum=8)
 
 ## Install
 
@@ -55,6 +57,7 @@ python pretrain.py --config pretrain_config.json
 Or override everything from the CLI:
 
 ```bash
+# Default 2k context (fits on 40GB+ GPUs)
 python pretrain.py \
   --steps 30000 \
   --warmup 1000 \
@@ -63,6 +66,23 @@ python pretrain.py \
   --batch 16 \
   --grad-accum 4 \
   --block 2048 \
+  --compile \
+  --save-dir /tmp/vortex_ckpt \
+  --hub-repo VTXAI/vortex-110m \
+  --push-every 1500 \
+  --log-every 25
+```
+
+```bash
+# 8k context on RTX 5090 (32GB VRAM)
+python pretrain.py \
+  --steps 30000 \
+  --warmup 1000 \
+  --lr 6e-4 \
+  --min-lr 6e-5 \
+  --batch 2 \
+  --grad-accum 8 \
+  --block 8192 \
   --compile \
   --save-dir /tmp/vortex_ckpt \
   --hub-repo VTXAI/vortex-110m \
@@ -164,10 +184,13 @@ python eval_benchmarks.py \
 
 ## GPU tips
 
-- **Batch sizing**: start small and scale up. On A100-80GB, `batch=8, grad_accum=8`
-  is the published starting point. Reduce `batch` if you OOM.
-- **Sequence length**: longer `--block` means more VRAM per sample.
-- **Compile**: `--compile` cuts wall-time but increases peak memory slightly.
+- **2k context (default)**: on A100-80GB, `batch=8, grad_accum=8` is the starting point.
+- **8k context**: on RTX 5090 (32GB), use `batch=2, grad_accum=8`. If you OOM, drop
+  `--batch` to 1 and raise `--grad-accum` to 16.
+- **Sequence length**: longer `--block` means more VRAM per sample. Activations scale
+  linearly with sequence length; the 111M model itself is tiny (~2GB in bf16).
+- **Compile**: `--compile` cuts wall-time but increases peak memory slightly. If OOM,
+  try disabling it.
 - **Precision**: training runs in `bf16` via `torch.amp.autocast("cuda", dtype=torch.bfloat16)`.
   Make sure your GPU supports bf16 (Ampere+).
 
