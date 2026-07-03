@@ -16,11 +16,11 @@ post-training. Optimized for single-GPU training with **bf16**, **torch.compile*
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU with **Ampere+ (A100 / RTX 30xx+)** for FlashAttention-2 + bf16
-- CUDA 11.8+ / 12.x
+- NVIDIA GPU with **Blackwell (RTX 50xx / RTX PRO 50xx)** or **Ampere+** for SDPA + bf16
+- CUDA 12.x
 - **VRAM guide**:
-  - ~80GB VRAM for the default config (batch=8, block=2048)
-  - ~32GB VRAM for 8k context on RTX 5090 / similar (batch=2, grad_accum=8)
+  - ~80GB VRAM for the default 2k config (A100-80GB, batch=8, grad_accum=8)
+  - ~32GB VRAM for 8k context on RTX 5090 (batch=2, grad_accum=8)
 
 ## Install
 
@@ -185,14 +185,14 @@ python eval_benchmarks.py \
 ## GPU tips
 
 - **2k context (default)**: on A100-80GB, `batch=8, grad_accum=8` is the starting point.
-- **8k context**: on RTX 5090 (32GB), use `batch=2, grad_accum=8`. If you OOM, drop
-  `--batch` to 1 and raise `--grad-accum` to 16.
+- **8k context**: on RTX 5090 (32GB GDDR7, Blackwell, 5th-gen Tensor Cores), use
+  `batch=2, grad_accum=8`. If you OOM, drop `--batch` to 1 and raise `--grad-accum` to 16.
 - **Sequence length**: longer `--block` means more VRAM per sample. Activations scale
   linearly with sequence length; the 111M model itself is tiny (~2GB in bf16).
 - **Compile**: `--compile` cuts wall-time but increases peak memory slightly. If OOM,
   try disabling it.
 - **Precision**: training runs in `bf16` via `torch.amp.autocast("cuda", dtype=torch.bfloat16)`.
-  Make sure your GPU supports bf16 (Ampere+).
+  Blackwell/Ampere+ GPUs have native bf16 Tensor Core support.
 
 ## Project structure
 
