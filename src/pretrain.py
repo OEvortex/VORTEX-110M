@@ -92,6 +92,7 @@ def parse_args():
     p.add_argument("--batch", type=int, default=None)
     p.add_argument("--grad-accum", type=int, default=None)
     p.add_argument("--block", type=int, default=None)
+    p.add_argument("--rope-theta", type=float, default=None, help="RoPE base frequency (default 1M, use 50M for 128k context)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--shards", nargs="+", default=None, help="Shard file paths (bin); default pulls from Hub")
     p.add_argument("--hub-repo", default=None)
@@ -291,8 +292,13 @@ def main():
         print(f"[pretrain] WARN: tokenizer profile failed: {e}", flush=True)
         vocab_size = 151670   # safe default (Qwen3 max id+1)
 
-    arch = VortexArch(max_position_embeddings=args.block, vocab_size=vocab_size)
+    arch_kwargs = dict(max_position_embeddings=args.block, vocab_size=vocab_size)
+    if getattr(args, "rope_theta", None) is not None:
+        arch_kwargs["rope_theta"] = args.rope_theta
+    arch = VortexArch(**arch_kwargs)
     cfg = VortexConfig(**{**vars(arch)})
+    if getattr(args, "rope_theta", None) is not None:
+        print(f"[pretrain] rope_theta={args.rope_theta:.0f} (context extension enabled)", flush=True)
 
     if resume:
         try:

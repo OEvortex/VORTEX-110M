@@ -1,0 +1,20 @@
+{
+  "steps": 76300,
+  "warmup": 1000,
+  "lr": 3e-4,
+  "min_lr": 3e-5,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.99,
+  "grad_clip": 1.0,
+  "batch": 4,
+  "grad_accum": 8,
+  "block": 2048,
+  "seed": 42,
+  "shards": "AUTO",
+  "hub_repo": "VTXAI/vtx-300m",
+  "push_every": 3000,
+  "log_every": 25,
+  "save_dir": "/tmp/vtx_300m_ckpts/stage1_2k",
+  "compile": true
+}

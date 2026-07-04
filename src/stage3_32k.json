@@ -1,0 +1,21 @@
+{
+  "steps": 1900,
+  "warmup": 200,
+  "lr": 5e-5,
+  "min_lr": 5e-6,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.99,
+  "grad_clip": 1.0,
+  "batch": 1,
+  "grad_accum": 32,
+  "block": 32768,
+  "seed": 42,
+  "shards": "AUTO",
+  "hub_repo": "VTXAI/vtx-300m",
+  "push_every": 500,
+  "log_every": 10,
+  "save_dir": "/tmp/vtx_300m_ckpts/stage3_32k",
+  "compile": true,
+  "rope_theta": 50000000
+}
