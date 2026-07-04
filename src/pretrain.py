@@ -26,6 +26,50 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+
+class Lion(torch.optim.Optimizer):
+    """LION optimizer — only stores momentum (half the VRAM of AdamW).
+
+    Paper: https://arxiv.org/abs/2302.06675
+    Recommended: lr 3-10x smaller than AdamW, betas=(0.9, 0.99)
+    """
+
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.999), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            wd = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+
+                # State: just momentum
+                state = self.state[p]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p)
+
+                exp_avg = state["exp_avg"]
+                update = exp_avg.mul(beta1).add(grad, alpha=1 - beta1)
+                p.add_(update.sign(), alpha=-lr)
+                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+
+        return loss
+
 # Trackio for monitoring
 try:
     import trackio
@@ -63,10 +107,10 @@ def parse_args():
     return p.parse_args()
 
 
-# Defaults tuned for RTX 5090 Blackwell (32GB VRAM)
+# Defaults tuned for RTX 5090 Blackwell (32GB VRAM) — Lion optimizer
 DEFAULTS = dict(
-    steps=76000, warmup=1000, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
-    beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=4,
+    steps=76000, warmup=1000, lr=3e-4, min_lr=3e-5, weight_decay=0.1,
+    beta1=0.9, beta2=0.99, grad_clip=1.0, batch=4, grad_accum=8,
     block=2048, seed=42, shards=None, hub_repo="VTXAI/vtx-300m",
     trackio_space="VTXAI/vtx-300m-trackio", trackio_project="vtx-300m",
     push_every=3000, token=None, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
@@ -288,14 +332,14 @@ def main():
             no_decay.append(p)
         else:
             decay.append(p)
-    optim = torch.optim.AdamW(
+    optim = Lion(
         [
             {"params": decay, "weight_decay": args.weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ],
-        lr=args.lr, betas=(args.beta1, args.beta2), eps=1e-8,
+        lr=args.lr, betas=(args.beta1, args.beta2),
     )
-    print(f"[pretrain] optimizer: AdamW, decay={sum(p.numel() for p in decay)/1e6:.1f}M no_decay={sum(p.numel() for p in no_decay)/1e6:.1f}M", flush=True)
+    print(f"[pretrain] optimizer: Lion (1 state, ~50% VRAM vs AdamW), decay={sum(p.numel() for p in decay)/1e6:.1f}M no_decay={sum(p.numel() for p in no_decay)/1e6:.1f}M", flush=True)
 
     # Load optimizer/RNG state if resuming
     start_step = 0
