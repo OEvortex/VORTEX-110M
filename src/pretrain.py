@@ -62,7 +62,7 @@ def parse_args():
 
 # Defaults tuned for RTX 5090 Blackwell (32GB VRAM)
 DEFAULTS = dict(
-    steps=30000, warmup=1000, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
+    steps=76000, warmup=1000, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
     beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=4,
     block=2048, seed=42, shards=None, hub_repo="VTXAI/vtx-300m",
     trackio_space="VTXAI/vtx-300m-trackio", trackio_project="vtx-300m",
@@ -173,8 +173,15 @@ def main():
           f"intermediate={cfg.intermediate_size} context={cfg.max_position_embeddings}", flush=True)
 
     if args.compile:
-        model = torch.compile(model, mode="default")
-        print(f"[pretrain] torch.compile enabled (mode=default)", flush=True)
+        import shutil
+        cc = os.environ.get("CC") or shutil.which("gcc") or shutil.which("cc")
+        if cc:
+            if not os.environ.get("CC"):
+                os.environ["CC"] = cc
+            model = torch.compile(model, mode="default")
+            print(f"[pretrain] torch.compile enabled (mode=default, CC={cc})", flush=True)
+        else:
+            print(f"[pretrain] WARN: no C compiler found, disabling torch.compile", flush=True)
 
     # ── Optimizer ──────────────────────────────────────────────────────
     decay, no_decay = [], []

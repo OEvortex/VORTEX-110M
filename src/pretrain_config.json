@@ -1,5 +1,5 @@
 {
-  "steps": 30000,
+  "steps": 76000,
   "warmup": 1000,
   "lr": 6e-4,
   "min_lr": 6e-5,
