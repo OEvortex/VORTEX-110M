@@ -54,7 +54,7 @@ def parse_args():
     p.add_argument("--trackio-space", default=None)
     p.add_argument("--trackio-project", default=None)
     p.add_argument("--push-every", type=int, default=None)
-    p.add_argument("--push-every-tokens", type=int, default=None, help="Push checkpoint every N tokens processed")
+    p.add_argument("--token", type=str, default=None, help="HuggingFace token for pushing checkpoints")
     p.add_argument("--log-every", type=int, default=None)
     p.add_argument("--save-dir", default=None)
     p.add_argument("--compile", action="store_true", default=None)
@@ -69,7 +69,7 @@ DEFAULTS = dict(
     beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=4,
     block=2048, seed=42, shards=None, hub_repo="VTXAI/vtx-300m",
     trackio_space="VTXAI/vtx-300m-trackio", trackio_project="vtx-300m",
-    push_every=3000, push_every_tokens=None, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
+    push_every=3000, token=None, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
 )
 
 
@@ -317,8 +317,6 @@ def main():
     losses = []
     t0 = time.time()
     steps_this_run = 0
-    tokens_this_run = 0
-    last_push_tokens = 0
     for step in range(start_step, args.steps):
         lr = cosine_lr(step, args.warmup, args.steps, args.lr, args.min_lr)
         for pg in optim.param_groups:
@@ -346,7 +344,6 @@ def main():
 
         losses.append(accum_loss)
         steps_this_run += 1
-        tokens_this_run += tok_per_step
         if (step + 1) % args.log_every == 0 or step == 0:
             dt = time.time() - t0
             tok_s = steps_this_run * tok_per_step / dt
@@ -365,22 +362,16 @@ def main():
                     "tokens": (step + 1) * tok_per_step,
                 })
 
-        # Push checkpoint on step interval, token interval, or final step
-        push_by_step = (step + 1) % args.push_every == 0
-        push_by_tokens = (args.push_every_tokens and
-                          tokens_this_run - last_push_tokens >= args.push_every_tokens)
-        push_final = (step + 1) == args.steps
-        if push_by_step or push_by_tokens or push_final:
+        if (step + 1) % args.push_every == 0 or (step + 1) == args.steps:
             ckpt = save_checkpoint(model, optim, step + 1, args, losses)
-            last_push_tokens = tokens_this_run
             if HAS_TRACKIO and os.environ.get("TRACKIO_SPACE_ID"):
                 trackio.log({"checkpoint_step": step + 1})
             if args.hub_repo:
                 from huggingface_hub import HfApi
-                api = HfApi()
+                api = HfApi(token=args.token)
                 api.upload_folder(
                     folder_path=ckpt, repo_id=args.hub_repo,
-                    commit_message=f"step {step+1}",
+                    commit_message=f"step {step+1}", token=args.token,
                 )
                 print(f"[pretrain] pushed to {args.hub_repo}", flush=True)
 
