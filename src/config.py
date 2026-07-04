@@ -1,5 +1,5 @@
 """
-Vortex-110M configuration and tokenizer profile.
+VTX-300M configuration and tokenizer profile.
 
 Sources architecture hyperparams from the local dataclass and tokenizer
 profile from `Qwen/Qwen3-4B` on the Hub.
@@ -11,24 +11,25 @@ from typing import Optional
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Architecture (110M active, weight-tied)
+# Architecture (~300M active, weight-tied, GQA)
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class VortexArch:
-    """Vortex-110M architecture hyperparameters (decoder-only Transformer).
+    """VTX-300M architecture hyperparameters (decoder-only Transformer).
 
-    Sized to land at ~110M total params with the Qwen3 vocab (~151,670).
-    With hidden=512, intermediate=1408, layers=12, the matrix is:
-      embed (151670 x 512)  =  77.7M
-      12 x layer            =  33.3M  (qkv+o+swiglu, hidden=512)
-      norms + head tied     =  +0
+    Sized to land at ~300M total params with the Qwen3 vocab (~151,670).
+    With hidden=768, intermediate=2048, layers=18, GQA(12q/4kv):
+      embed (151670 x 768)  = 116.5M
+      18 x layer            = ~184M  (GQA attn + SwiGLU MLP)
+      norms + head tied     =   +0
       ----------------------------------
-      Total                 ≈ 111M
+      Total                 ≈ 300M
     """
-    hidden_size: int = 512
-    num_hidden_layers: int = 12
-    num_attention_heads: int = 8
-    intermediate_size: int = 1408
+    hidden_size: int = 768
+    num_hidden_layers: int = 18
+    num_attention_heads: int = 12
+    num_key_value_heads: int = 4         # GQA: 4 KV heads shared across 12 Q heads
+    intermediate_size: int = 2048
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-5
     rope_theta: float = 1_000_000.0
@@ -42,13 +43,21 @@ class VortexArch:
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
 
+    @property
+    def num_attention_kv_heads(self) -> int:
+        return self.num_key_value_heads
+
     def n_params_estimate(self) -> int:
         """Crude estimate (no embeddings / no lm_head)."""
-        per_layer = (
-            2 * self.hidden_size * self.hidden_size * 3  # q,k,v,o (note: 2*hs^2*3 = 4*hs^2)
-            + 3 * self.hidden_size * self.intermediate_size  # gate,up,down
-        )
-        return self.num_hidden_layers * per_layer
+        hs = self.hidden_size
+        nh = self.num_attention_heads
+        nkv = self.num_key_value_heads
+        hd = hs // nh
+        # GQA attention: Q(12h*d) + K(4h*d) + V(4h*d) + O(h*h)
+        attn = hs * (nh * hd + nkv * hd + nkv * hd + hs)
+        # SwiGLU: gate + up + down
+        mlp = 3 * hs * self.intermediate_size
+        return self.num_hidden_layers * (attn + mlp)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -56,10 +65,10 @@ class VortexArch:
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class HubConfig:
-    model_repo: str = "VTXAI/vortex-110m"
-    data_repo: str = "VTXAI/vortex-110m-data"
-    trackio_space_id: str = "VTXAI/vortex-110m-trackio"
-    trackio_project: str = "vortex-110m"
+    model_repo: str = "VTXAI/vtx-300m"
+    data_repo: str = "VTXAI/vtx-300m-data"
+    trackio_space_id: str = "VTXAI/vtx-300m-trackio"
+    trackio_project: str = "vtx-300m"
 
     def __post_init__(self):
         for placeholder in ["<", "TODO", "todo"]:

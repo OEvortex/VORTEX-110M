@@ -1,15 +1,15 @@
 """
-Vortex-110M pretraining script.
+VTX-300M pretraining script.
 
-Trains the custom Vortex-110M model on pre-tokenized memory-mapped data
-using bf16 mixed precision + torch.compile + AdamW. Pushes checkpoints
-to the configured Hub repo on a schedule.
+Trains the custom VTX-300M model (GQA, SwiGLU, RoPE, RMSNorm) on
+pre-tokenized memory-mapped data using bf16 mixed precision +
+torch.compile + AdamW. Pushes checkpoints to the configured Hub repo.
 
-Run on a single GPU (A100-80GB recommended for batch=8).
+Optimized for single-GPU training on RTX 5090 Blackwell (32GB VRAM).
 
 Usage:
     python pretrain.py --config pretrain_config.json
-    python pretrain.py --steps 40000 --batch 8 --grad-accum 8 --block 2048 \
+    python pretrain.py --steps 30000 --batch 8 --grad-accum 4 --block 2048 \
         --shards path/to/shard_0000.bin path/to/shard_0001.bin ...
 """
 from __future__ import annotations
@@ -60,12 +60,13 @@ def parse_args():
     return p.parse_args()
 
 
+# Defaults tuned for RTX 5090 Blackwell (32GB VRAM)
 DEFAULTS = dict(
-    steps=40000, warmup=1000, lr=1.2e-3, min_lr=1.2e-4, weight_decay=0.1,
-    beta1=0.9, beta2=0.95, grad_clip=1.0, batch=64, grad_accum=2,
-    block=8192, seed=42, shards=None, hub_repo="VTXAI/vortex-110m",
-    trackio_space="VTXAI/vortex-110m-trackio", trackio_project="vortex-110m",
-    push_every=3000, log_every=20, save_dir="/tmp/vortex_ckpt", compile=True,
+    steps=30000, warmup=1000, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
+    beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=4,
+    block=2048, seed=42, shards=None, hub_repo="VTXAI/vtx-300m",
+    trackio_space="VTXAI/vtx-300m-trackio", trackio_project="vtx-300m",
+    push_every=3000, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
 )
 
 
@@ -99,7 +100,7 @@ def get_default_shards():
     from huggingface_hub import snapshot_download
     print("[pretrain] downloading data shards from Hub...", flush=True)
     local_data = snapshot_download(
-        repo_id="VTXAI/vortex-110m-data",
+        repo_id="VTXAI/vtx-300m-data",
         repo_type="dataset",
         allow_patterns=["data/*.bin"],
     )
@@ -126,6 +127,10 @@ def main():
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[pretrain] device={device}  ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'})", flush=True)
+
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        print(f"[pretrain] VRAM: {vram_gb:.1f}GB", flush=True)
 
     # ── Data ───────────────────────────────────────────────────────────
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -155,7 +160,7 @@ def main():
         print(f"[pretrain] tokenizer: {prof.tokenizer_id} vocab={vocab_size} eos={prof.eos_token_id}", flush=True)
     except Exception as e:
         print(f"[pretrain] WARN: tokenizer profile failed: {e}", flush=True)
-        vocab_size = 151670   # safe default (Qwen3-4B max id+1)
+        vocab_size = 151670   # safe default (Qwen3 max id+1)
 
     arch = VortexArch(max_position_embeddings=args.block, vocab_size=vocab_size)
     cfg = VortexConfig(**{**vars(arch)})
@@ -163,6 +168,9 @@ def main():
     n = sum(p.numel() for p in model.parameters())
     n_no_embed = n - model.model.embed_tokens.weight.numel()
     print(f"[pretrain] model: {n/1e6:.1f}M params ({n_no_embed/1e6:.1f}M non-embed)", flush=True)
+    print(f"[pretrain] architecture: hidden={cfg.hidden_size} layers={cfg.num_hidden_layers} "
+          f"heads={cfg.num_attention_heads} kv_heads={getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads)} "
+          f"intermediate={cfg.intermediate_size} context={cfg.max_position_embeddings}", flush=True)
 
     if args.compile:
         model = torch.compile(model, mode="default")

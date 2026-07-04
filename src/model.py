@@ -1,11 +1,12 @@
 """
-Vortex-110M — a custom ~110M parameter decoder-only Transformer.
+VTX-300M — a custom ~300M parameter decoder-only Transformer with GQA.
 
 Features:
 - Pre-LayerNorm (RMSNorm)
 - Rotary Position Embeddings (RoPE)
+- Grouped Query Attention (GQA): 12 Q heads, 4 KV heads
 - SwiGLU MLP
-- Native SDPA attention (FlashAttention-2 on supported GPUs)
+- Native SDPA attention (FlashAttention-2 on Blackwell/Ampere+)
 - Strict weight tying between input embeddings and the LM head
 
 This is a from-scratch architecture, not a port of an HF class — it is
@@ -55,7 +56,6 @@ class VortexRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute in fp32 for numerical stability, then cast back.
         in_dtype = x.dtype
         x = x.float()
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
@@ -63,44 +63,47 @@ class VortexRMSNorm(nn.Module):
 
 
 def _precompute_rope_cache(head_dim: int, max_seq_len: int, base: float, device, dtype):
-    """Build (cos, sin) tables of shape (max_seq_len, head_dim/2).
-
-    Standard RoPE: we have head_dim/2 rotation frequencies, and each
-    rotates a pair of input features. The cache is (T, head_dim/2); we
-    duplicate at apply-time so the result is (B, H, T, head_dim).
-    """
+    """Build (cos, sin) tables of shape (max_seq_len, head_dim/2)."""
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
     t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)             # (T, head_dim/2)
+    freqs = torch.outer(t, inv_freq)
     return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Apply rotary embeddings to last dim of x (B, H, T, D).
 
-    cos/sin: (T, D/2). Standard interleaved RoPE:
+    Standard interleaved RoPE:
         y[..., 2i]   = x[..., 2i]   * cos[i] - x[..., 2i+1] * sin[i]
         y[..., 2i+1] = x[..., 2i+1] * cos[i] + x[..., 2i]   * sin[i]
     """
     T = x.shape[-2]
-    cos = cos[:T].unsqueeze(0).unsqueeze(0)   # (1, 1, T, D/2)
-    sin = sin[:T].unsqueeze(0).unsqueeze(0)   # (1, 1, T, D/2)
-    x1, x2 = x.chunk(2, dim=-1)               # (B, H, T, D/2), (B, H, T, D/2)
-    out1 = x1 * cos - x2 * sin                # (B, H, T, D/2)
-    out2 = x2 * cos + x1 * sin                # (B, H, T, D/2)
+    cos = cos[:T].unsqueeze(0).unsqueeze(0)
+    sin = sin[:T].unsqueeze(0).unsqueeze(0)
+    x1, x2 = x.chunk(2, dim=-1)
+    out1 = x1 * cos - x2 * sin
+    out2 = x2 * cos + x1 * sin
     return torch.cat([out1, out2], dim=-1)
 
 
 class VortexAttention(nn.Module):
-    """Multi-head self-attention with RoPE and SDPA (FlashAttention-2)."""
+    """Grouped Query Self-Attention with RoPE and SDPA (FlashAttention-2).
+
+    GQA: num_attention_heads Q heads, num_key_value_heads KV heads.
+    When num_kv_heads < num_heads, KV heads are repeated to match Q heads.
+    """
     def __init__(self, cfg: VortexConfig):
         super().__init__()
         self.num_heads = cfg.num_attention_heads
+        self.num_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
         self.head_dim = cfg.hidden_size // cfg.num_attention_heads
         self.scaling = self.head_dim ** -0.5
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
 
-        # Combined QKV projection for fewer kernel launches.
-        self.qkv_proj = nn.Linear(cfg.hidden_size, 3 * cfg.hidden_size, bias=False)
+        # Q projection: full heads.  KV projections: GQA reduced.
+        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
 
         # RoPE cache (built lazily on first forward)
@@ -115,19 +118,26 @@ class VortexAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        qkv = self.qkv_proj(x)                    # (B, T, 3*C)
-        qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)               # each (B, T, H, D)
-        q = q.transpose(1, 2)                     # (B, H, T, D)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+
+        q = self.q_proj(x)          # (B, T, num_heads * head_dim)
+        k = self.k_proj(x)          # (B, T, num_kv_heads * head_dim)
+        v = self.v_proj(x)          # (B, T, num_kv_heads * head_dim)
+
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)       # (B, Hq, T, D)
+        k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # (B, Hkv, T, D)
+        v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # (B, Hkv, T, D)
 
         # RoPE on Q and K
         self._ensure_rope(T, x.device, x.dtype)
         q = _apply_rope(q, self._cos, self._sin)
         k = _apply_rope(k, self._cos, self._sin)
 
-        # Causal SDPA (uses FlashAttention-2 on Ampere+ when available)
+        # Expand KV heads to match Q heads for SDPA
+        if self.num_kv_groups > 1:
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)   # (B, Hq, T, D)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)   # (B, Hq, T, D)
+
+        # Causal SDPA — FlashAttention-2 on Blackwell/Ampere+
         out = F.scaled_dot_product_attention(
             q, k, v,
             is_causal=True,
@@ -177,7 +187,6 @@ class VortexModel(PreTrainedModel):
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList([VortexBlock(cfg) for _ in range(cfg.num_hidden_layers)])
         self.norm = VortexRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        # Init
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -197,7 +206,6 @@ class VortexModel(PreTrainedModel):
 
 class VortexForCausalLM(PreTrainedModel):
     config_class = VortexConfig
-    # HF 5.x format: dict {target_param: source_param} per module
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, cfg: VortexConfig | VortexArch):
@@ -217,16 +225,13 @@ class VortexForCausalLM(PreTrainedModel):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-        # Finalize: ensures all_tied_weights_keys and friends are set
-        # (called automatically for registered HF models; we call explicitly
-        # because we are a custom class).
         self.post_init()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        chunk_size: int = 0,  # 0 = no chunking; >0 = time chunk size for CE
+        chunk_size: int = 0,
     ):
         hidden = self.model(input_ids)
         loss = None
@@ -234,18 +239,14 @@ class VortexForCausalLM(PreTrainedModel):
         if labels is not None:
             shift_hidden = hidden[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Use chunked CE to avoid OOM on big-vocab T4
             chunk = chunk_size if chunk_size > 0 else 1024
             loss = self._chunked_ce(shift_hidden, shift_labels, chunk=chunk)
         else:
-            # Only compute full logits for inference / generation
             logits = self.lm_head(hidden)
         return type("VortexOutput", (), {"loss": loss, "logits": logits})()
 
     def _chunked_ce(self, hidden: torch.Tensor, labels: torch.Tensor, chunk: int) -> torch.Tensor:
-        """Cross-entropy in time chunks. Avoids materialising (B*T, V) at once.
-        Uses reduction='sum' and normalises by the count of valid (non -100) labels.
-        """
+        """Cross-entropy in time chunks to avoid OOM on large vocab."""
         B, T, H = hidden.shape
         flat_h = hidden.view(B * T, H)
         flat_y = labels.reshape(B * T)
@@ -256,17 +257,14 @@ class VortexForCausalLM(PreTrainedModel):
         for i in range(0, flat_h.shape[0], chunk):
             h_chunk = flat_h[i:i + chunk]
             y_chunk = flat_y[i:i + chunk]
-            # lm_head uses tied weight (embed_tokens.weight)
-            logits = self.lm_head(h_chunk).float()       # (chunk, V) in fp32
+            logits = self.lm_head(h_chunk).float()
             loss = F.cross_entropy(logits, y_chunk, ignore_index=-100, reduction="sum")
             total = total + loss
             del logits
         return total / n_valid.clamp_min(1)
 
-    # Hook for HF: ensures the lm_head stays tied if anyone calls it.
     def tie_weights(self, recompute_mapping: bool = False, missing_keys: dict | None = None):
         if self.cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-        # If caller passed missing_keys, filter out the ones we just tied
         if missing_keys is not None:
             missing_keys.discard("lm_head.weight")

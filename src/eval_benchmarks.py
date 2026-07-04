@@ -1,7 +1,7 @@
 """
-Vortex-110M benchmark evaluation.
+VTX-300M benchmark evaluation.
 
-Evaluates a trained Vortex-110M checkpoint on standard NLP benchmarks:
+Evaluates a trained VTX-300M checkpoint on standard NLP benchmarks:
 - HellaSwag (commonsense)
 - ARC-Easy, ARC-Challenge (reasoning)
 - PIQA (physical reasoning)
@@ -25,12 +25,12 @@ import numpy as np
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, help="Path to Vortex checkpoint dir (or Hub repo id)")
+    p.add_argument("--ckpt", required=True, help="Path to VTX-300M checkpoint dir (or Hub repo id)")
     p.add_argument("--tokenizer", default="Qwen/Qwen3-4B")
     p.add_argument("--tasks", nargs="+", default=["hellaswag", "arc_easy", "arc_challenge", "piqa", "winogrande"])
     p.add_argument("--limit", type=int, default=None, help="Limit examples per task (for smoke)")
     p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--out", default="vortex_eval.json")
+    p.add_argument("--out", default="vtx_300m_eval.json")
     return p.parse_args()
 
 
@@ -43,16 +43,13 @@ def score_choices(model, tokenizer, context: str, choices: list[str], device: st
     for choice in choices:
         full = context + choice
         full_ids = tokenizer(full, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-        # Truncate to model's max position
         if full_ids.shape[1] > max_pos:
             continue
         n_ctx = ctx_ids.shape[1]
         out = model(input_ids=full_ids, labels=None, chunk_size=0)
-        logits = out.logits  # (1, T, V)
-        # Shift
+        logits = out.logits
         shift_logits = logits[0, :-1, :].float()
         shift_labels = full_ids[0, 1:]
-        # Loss only on choice tokens
         T = shift_labels.shape[0]
         n_choice = T - n_ctx + 1
         if n_choice <= 0:
@@ -62,12 +59,11 @@ def score_choices(model, tokenizer, context: str, choices: list[str], device: st
             shift_logits, shift_labels, reduction="none"
         )
         choice_loss = ce[n_ctx - 1:].sum().item()
-        scores.append(-choice_loss)  # log-likelihood
+        scores.append(-choice_loss)
     return scores
 
 
 def eval_hellaswag(model, tokenizer, device: str, limit=None, batch_size=8) -> dict:
-    """HellaSwag: 4-way multiple choice, pick highest log-prob."""
     from datasets import load_dataset
     ds = load_dataset("Rowan/hellaswag", split="validation", trust_remote_code=True)
     if limit:
@@ -76,7 +72,6 @@ def eval_hellaswag(model, tokenizer, device: str, limit=None, batch_size=8) -> d
     for ex in ds:
         ctx = ex["ctx_a"] + " " + ex["ctx_b"]
         endings = ex["endings"]
-        # Activity label: 0..3
         label = int(ex["label"])
         scores = score_choices(model, tokenizer, ctx, endings, device)
         if not scores:
@@ -142,9 +137,8 @@ def eval_winogrande(model, tokenizer, device: str, limit=None) -> dict:
     correct, total = 0, 0
     for ex in ds:
         ctx = ex["sentence"]
-        # Replace the blank with each option
         opt1, opt2 = ex["option1"], ex["option2"]
-        ans = int(ex["answer"]) - 1  # 1 or 2 -> 0 or 1
+        ans = int(ex["answer"]) - 1
         s1 = ctx.replace("_", opt1)
         s2 = ctx.replace("_", opt2)
         scores = score_choices(model, tokenizer, "", [s1, s2], device)

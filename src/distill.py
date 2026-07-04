@@ -1,12 +1,9 @@
 """
-Vortex-110M post-distillation runner.
+VTX-300M post-distillation runner.
 
 Calls Arcee AI's DistillKit with the prepared YAML config, using the trained
-Vortex-110M as the student and arcee-ai/Qwen3-235B-Logits-Packed-8192 as the
-teacher (pre-packed logit dataset with the exact compression spec the user
-specified: d=151936 [vocab size, dynamically mirrored from student model],
-k=128, exact_k=32, exact_dtype=float32, polynomial_terms=[0,1,2],
-delta_encoding=True, error_diffusion=False).
+VTX-300M as the student and arcee-ai/Qwen3-235B-Logits-Packed-8192 as the
+teacher (pre-packed logit dataset).
 
 Loss: 0.5*cross_entropy + 0.5*kl at temperature 1.0
 """
@@ -20,15 +17,15 @@ from pathlib import Path
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--student-ckpt", default="VTXAI/vortex-110m",
-                   help="HF repo id or local path of the student Vortex-110M")
+    p.add_argument("--student-ckpt", default="VTXAI/vtx-300m",
+                   help="HF repo id or local path of the student VTX-300M")
     p.add_argument("--distill-config", default="distill_config.yml")
-    p.add_argument("--out", default="VTXAI/vortex-110m-distilled")
+    p.add_argument("--out", default="VTXAI/vtx-300m-distilled")
     p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=8)
-    p.add_argument("--max-seq-len", type=int, default=8192)
+    p.add_argument("--max-seq-len", type=int, default=2048)
     return p.parse_args()
 
 
@@ -38,9 +35,6 @@ def main():
     print(f"[distill] distill config: {args.distill_config}")
     print(f"[distill] output: {args.out}")
 
-    # We invoke Arcee DistillKit's CLI. DistillKit is `pip install distill-kit`
-    # (arcee-ai/distill-kit on github). It ships `distillkit` or `distill` as
-    # an entrypoint. We pass our YAML.
     cmd = [
         "distillkit", "run",
         "--config", args.distill_config,

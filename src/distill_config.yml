@@ -1,4 +1,4 @@
-# Vortex-110M Distillation Configuration
+# VTX-300M Distillation Configuration
 #
 # Use with Arcee AI's DistillKit:
 #   pip install distill-kit
@@ -6,11 +6,11 @@
 #
 # Source: https://github.com/arcee-ai/DistillKit
 # Dataset: arcee-ai/Qwen3-235B-Logits-Packed-8192
-# Student: VTXAI/vortex-110m (after pretraining)
+# Student: VTXAI/vtx-300m (after pretraining)
 
 student:
   kind: "model"
-  name_or_path: "VTXAI/vortex-110m"
+  name_or_path: "VTXAI/vtx-300m"
   dtype: "bfloat16"
   attn_implementation: "sdpa"
   trust_remote_code: true
@@ -19,10 +19,8 @@ teacher:
   kind: "dataset"
   name_or_path: "arcee-ai/Qwen3-235B-Logits-Packed-8192"
   prepacked: true
-  sequence_length: 8192
+  sequence_length: 2048
   logprob_compressor:
-    # d must match student vocab size; for Vortex-110M this is 151643
-    # (override if you change the tokenizer)
     d: 151643
     k: 128
     exact_k: 32
@@ -34,14 +32,14 @@ teacher:
 data:
   dataset_name: "arcee-ai/Qwen3-235B-Logits-Packed-8192"
   text_field: "text"
-  max_seq_length: 8192
+  max_seq_length: 2048
   packing: true
   preprocessing_num_workers: 8
 
 training:
-  output_dir: "./vortex-110m-distilled"
+  output_dir: "./vtx-300m-distilled"
   per_device_train_batch_size: 2
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 8
   num_train_epochs: 1
   max_steps: -1
   learning_rate: 2.0e-5
@@ -56,10 +54,10 @@ training:
   save_steps: 1000
   save_total_limit: 3
   report_to: ["trackio"]
-  trackio_project: "vortex-110m-distill"
-  trackio_space_id: "VTXAI/vortex-110m-trackio"
+  trackio_project: "vtx-300m-distill"
+  trackio_space_id: "VTXAI/vtx-300m-trackio"
   push_to_hub: true
-  hub_model_id: "VTXAI/vortex-110m-distilled"
+  hub_model_id: "VTXAI/vtx-300m-distilled"
   hub_strategy: "every_save"
 
 distillation:
