@@ -187,6 +187,7 @@ class VortexModel(PreTrainedModel):
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList([VortexBlock(cfg) for _ in range(cfg.num_hidden_layers)])
         self.norm = VortexRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.gradient_checkpointing = False
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -200,7 +201,10 @@ class VortexModel(PreTrainedModel):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
-            x = layer(x)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         return self.norm(x)
 
 
@@ -227,6 +231,12 @@ class VortexForCausalLM(PreTrainedModel):
 
         self.post_init()
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        self.model.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self, **kwargs):
+        self.model.gradient_checkpointing = False
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -239,7 +249,7 @@ class VortexForCausalLM(PreTrainedModel):
         if labels is not None:
             shift_hidden = hidden[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            chunk = chunk_size if chunk_size > 0 else 1024
+            chunk = chunk_size if chunk_size > 0 else 256
             loss = self._chunked_ce(shift_hidden, shift_labels, chunk=chunk)
         else:
             logits = self.lm_head(hidden)

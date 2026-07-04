@@ -303,6 +303,10 @@ def main():
         start_step = load_checkpoint(ckpt_path, model, optim, device)
         print(f"[pretrain] resuming from step {start_step}", flush=True)
 
+    # Enable gradient checkpointing to save VRAM (~40% less activation memory)
+    model.gradient_checkpointing_enable()
+    print(f"[pretrain] gradient checkpointing enabled", flush=True)
+
     # ── Train ──────────────────────────────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
     accum = args.grad_accum
