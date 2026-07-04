@@ -11,6 +11,7 @@ Usage:
     python pretrain.py --config pretrain_config.json
     python pretrain.py --steps 30000 --batch 8 --grad-accum 4 --block 2048 \
         --shards path/to/shard_0000.bin path/to/shard_0001.bin ...
+    python pretrain.py --no-resume   # ignore checkpoints, start fresh
 """
 from __future__ import annotations
 import os
@@ -53,10 +54,12 @@ def parse_args():
     p.add_argument("--trackio-space", default=None)
     p.add_argument("--trackio-project", default=None)
     p.add_argument("--push-every", type=int, default=None)
+    p.add_argument("--push-every-tokens", type=int, default=None, help="Push checkpoint every N tokens processed")
     p.add_argument("--log-every", type=int, default=None)
     p.add_argument("--save-dir", default=None)
     p.add_argument("--compile", action="store_true", default=None)
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--no-resume", action="store_true", help="Start fresh, ignore existing checkpoints")
     return p.parse_args()
 
 
@@ -66,7 +69,7 @@ DEFAULTS = dict(
     beta1=0.9, beta2=0.95, grad_clip=1.0, batch=8, grad_accum=4,
     block=2048, seed=42, shards=None, hub_repo="VTXAI/vtx-300m",
     trackio_space="VTXAI/vtx-300m-trackio", trackio_project="vtx-300m",
-    push_every=3000, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
+    push_every=3000, push_every_tokens=None, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
 )
 
 
@@ -109,6 +112,80 @@ def get_default_shards():
     return shards
 
 
+def find_latest_checkpoint(save_dir):
+    """Find the latest checkpoint directory in save_dir.
+
+    Looks for step_N directories and returns (path, step_number) of the
+    highest-numbered one, or (None, 0) if nothing is found.
+    """
+    if not os.path.isdir(save_dir):
+        return None, 0
+    candidates = []
+    for name in os.listdir(save_dir):
+        if name.startswith("step_") and os.path.isdir(os.path.join(save_dir, name)):
+            try:
+                step_num = int(name.split("_", 1)[1])
+                candidates.append((step_num, os.path.join(save_dir, name)))
+            except ValueError:
+                continue
+    if not candidates:
+        return None, 0
+    candidates.sort(key=lambda x: x[0])
+    best_step, best_path = candidates[-1]
+    # Verify it has both model weights and training state
+    has_model = any(f.endswith(".safetensors") or f.endswith(".bin")
+                    for f in os.listdir(best_path))
+    has_state = os.path.exists(os.path.join(best_path, "training_state.pt"))
+    if not has_model:
+        print(f"[pretrain] WARN: checkpoint at {best_path} has no model weights, skipping", flush=True)
+        return None, 0
+    if not has_state:
+        print(f"[pretrain] WARN: checkpoint at {best_path} has no training_state.pt, "
+              f"will resume from model weights only (optimizer reset)", flush=True)
+    return best_path, best_step
+
+
+def save_checkpoint(model, optim, step, args, losses):
+    """Save model + optimizer + training state to a checkpoint directory."""
+    ckpt = os.path.join(args.save_dir, f"step_{step}")
+    os.makedirs(ckpt, exist_ok=True)
+    save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    save_model.save_pretrained(ckpt)
+    # Save optimizer + step + RNG states for faithful resume
+    torch.save({
+        "step": step,
+        "optim": optim.state_dict(),
+        "rng": {
+            "torch": torch.random.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        },
+        "config": vars(args),
+    }, os.path.join(ckpt, "training_state.pt"))
+    print(f"[pretrain] saved checkpoint: {ckpt}", flush=True)
+    return ckpt
+
+
+def load_checkpoint(ckpt_path, model, optim, device):
+    """Load optimizer state and step number from a checkpoint.
+
+    Model weights are assumed already loaded by from_pretrained.
+    Returns the step to resume from (next step after the saved one).
+    """
+    state_file = os.path.join(ckpt_path, "training_state.pt")
+    if not os.path.exists(state_file):
+        return 0
+    state = torch.load(state_file, map_location=device, weights_only=False)
+    optim.load_state_dict(state["optim"])
+    rng = state.get("rng", {})
+    if rng.get("torch") is not None:
+        torch.random.set_rng_state(rng["torch"])
+    if rng.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(rng["cuda"])
+    resumed_step = state["step"]
+    print(f"[pretrain] loaded training state from step {resumed_step}", flush=True)
+    return resumed_step + 1  # resume from next step
+
+
 def main():
     args = resolve_args()
     print(f"[pretrain] args: {vars(args)}", flush=True)
@@ -131,6 +208,14 @@ def main():
     if torch.cuda.is_available():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[pretrain] VRAM: {vram_gb:.1f}GB", flush=True)
+
+    # ── Checkpoint auto-discovery ──────────────────────────────────────
+    ckpt_path, ckpt_step = find_latest_checkpoint(args.save_dir)
+    resume = ckpt_path is not None and not getattr(args, "no_resume", False)
+    if resume:
+        print(f"[pretrain] found checkpoint: {ckpt_path} (step {ckpt_step})", flush=True)
+    elif ckpt_path:
+        print(f"[pretrain] --no-resume set, ignoring checkpoint at {ckpt_path}", flush=True)
 
     # ── Data ───────────────────────────────────────────────────────────
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -164,7 +249,18 @@ def main():
 
     arch = VortexArch(max_position_embeddings=args.block, vocab_size=vocab_size)
     cfg = VortexConfig(**{**vars(arch)})
-    model = VortexForCausalLM(cfg).to(device)
+
+    if resume:
+        try:
+            print(f"[pretrain] loading model from checkpoint: {ckpt_path}", flush=True)
+            model = VortexForCausalLM.from_pretrained(ckpt_path).to(device)
+        except Exception as e:
+            print(f"[pretrain] WARN: failed to load checkpoint ({e}), training from scratch", flush=True)
+            resume = False
+            model = VortexForCausalLM(cfg).to(device)
+    else:
+        model = VortexForCausalLM(cfg).to(device)
+
     n = sum(p.numel() for p in model.parameters())
     n_no_embed = n - model.model.embed_tokens.weight.numel()
     print(f"[pretrain] model: {n/1e6:.1f}M params ({n_no_embed/1e6:.1f}M non-embed)", flush=True)
@@ -201,6 +297,12 @@ def main():
     )
     print(f"[pretrain] optimizer: AdamW, decay={sum(p.numel() for p in decay)/1e6:.1f}M no_decay={sum(p.numel() for p in no_decay)/1e6:.1f}M", flush=True)
 
+    # Load optimizer/RNG state if resuming
+    start_step = 0
+    if resume:
+        start_step = load_checkpoint(ckpt_path, model, optim, device)
+        print(f"[pretrain] resuming from step {start_step}", flush=True)
+
     # ── Train ──────────────────────────────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
     accum = args.grad_accum
@@ -208,11 +310,16 @@ def main():
     tok_per_step = eff_bs * args.block
     print(f"[pretrain] effective batch={eff_bs}, tokens/step={tok_per_step:,}", flush=True)
     print(f"[pretrain] total tokens: {args.steps * tok_per_step / 1e9:.2f}B", flush=True)
+    if start_step > 0:
+        print(f"[pretrain] remaining tokens: {(args.steps - start_step) * tok_per_step / 1e9:.2f}B", flush=True)
 
     model.train()
     losses = []
     t0 = time.time()
-    for step in range(args.steps):
+    steps_this_run = 0
+    tokens_this_run = 0
+    last_push_tokens = 0
+    for step in range(start_step, args.steps):
         lr = cosine_lr(step, args.warmup, args.steps, args.lr, args.min_lr)
         for pg in optim.param_groups:
             pg["lr"] = lr
@@ -238,9 +345,11 @@ def main():
         optim.step()
 
         losses.append(accum_loss)
+        steps_this_run += 1
+        tokens_this_run += tok_per_step
         if (step + 1) % args.log_every == 0 or step == 0:
             dt = time.time() - t0
-            tok_s = (step + 1) * tok_per_step / dt
+            tok_s = steps_this_run * tok_per_step / dt
             avg = sum(losses[-args.log_every:]) / max(1, len(losses[-args.log_every:]))
             log_line = (
                 f"step={step+1}/{args.steps} loss={avg:.4f} lr={lr:.2e} "
@@ -256,11 +365,14 @@ def main():
                     "tokens": (step + 1) * tok_per_step,
                 })
 
-        if (step + 1) % args.push_every == 0 or (step + 1) == args.steps:
-            ckpt = os.path.join(args.save_dir, f"step_{step+1}")
-            os.makedirs(ckpt, exist_ok=True)
-            save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            save_model.save_pretrained(ckpt)
+        # Push checkpoint on step interval, token interval, or final step
+        push_by_step = (step + 1) % args.push_every == 0
+        push_by_tokens = (args.push_every_tokens and
+                          tokens_this_run - last_push_tokens >= args.push_every_tokens)
+        push_final = (step + 1) == args.steps
+        if push_by_step or push_by_tokens or push_final:
+            ckpt = save_checkpoint(model, optim, step + 1, args, losses)
+            last_push_tokens = tokens_this_run
             if HAS_TRACKIO and os.environ.get("TRACKIO_SPACE_ID"):
                 trackio.log({"checkpoint_step": step + 1})
             if args.hub_repo:
