@@ -18,7 +18,7 @@ class VortexArch:
     """VTX-300M architecture hyperparameters (decoder-only Transformer).
 
     Sized to land at ~300M total params with the Qwen3 vocab (~151,670).
-    With hidden=768, intermediate=2048, layers=18, GQA(12q/4kv):
+    With hidden=768, intermediate=3744, layers=18, GQA(12q/4kv):
       embed (151670 x 768)  = 116.5M
       18 x layer            = ~184M  (GQA attn + SwiGLU MLP)
       norms + head tied     =   +0
@@ -29,7 +29,7 @@ class VortexArch:
     num_hidden_layers: int = 18
     num_attention_heads: int = 12
     num_key_value_heads: int = 4         # GQA: 4 KV heads shared across 12 Q heads
-    intermediate_size: int = 2048
+    intermediate_size: int = 3744
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-5
     rope_theta: float = 1_000_000.0
