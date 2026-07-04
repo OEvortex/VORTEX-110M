@@ -66,7 +66,7 @@ class VortexArch:
 @dataclass
 class HubConfig:
     model_repo: str = "VTXAI/vtx-300m"
-    data_repo: str = "VTXAI/vtx-300m-data"
+    data_repo: str = "VTXAI/vortex-110m-data"
     trackio_space_id: str = "VTXAI/vtx-300m-trackio"
     trackio_project: str = "vtx-300m"
 

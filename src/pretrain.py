@@ -100,7 +100,7 @@ def get_default_shards():
     from huggingface_hub import snapshot_download
     print("[pretrain] downloading data shards from Hub...", flush=True)
     local_data = snapshot_download(
-        repo_id="VTXAI/vtx-300m-data",
+        repo_id="VTXAI/vortex-110m-data",
         repo_type="dataset",
         allow_patterns=["data/*.bin"],
     )
