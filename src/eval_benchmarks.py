@@ -26,18 +26,49 @@ import numpy as np
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True, help="Path to a Vortex checkpoint dir (or Hub repo id)")
-    p.add_argument("--tokenizer", default="VTXAI/vortex-tok-8k",
-                   help="MUST be the tokenizer the shards/checkpoint were trained with")
+    p.add_argument("--tokenizer", default=None,
+                   help="MUST be the tokenizer the checkpoint was trained with. "
+                        "Defaults to the tokenizer shipped inside the checkpoint, "
+                        "then to the Hub default for its architecture.")
     p.add_argument("--tasks", nargs="+", default=["hellaswag", "arc_easy", "arc_challenge", "piqa", "winogrande"])
     p.add_argument("--limit", type=int, default=None, help="Limit examples per task (for smoke)")
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--batch", type=int, default=8, help="Unused; kept for CLI compatibility")
     p.add_argument("--out", default="vortex_50m_eval.json")
     return p.parse_args()
 
 
+def resolve_tokenizer_path(ckpt, explicit):
+    """Find the tokenizer that matches the checkpoint.
+
+    A vocab mismatch is not cosmetic: every logit index above the model's
+    vocab_size is unreachable, and a tokenizer with DIFFERENT ids below it
+    scores the wrong continuations. The previous default was the 8K
+    tokenizer, while the shipped model is 16K -- so every score was computed
+    against a tokenizer that could not even represent the model's ids.
+
+    Resolution order, most trustworthy first:
+      1. --tokenizer, if given
+      2. a tokenizer saved inside the checkpoint (sft.py writes one there)
+      3. the architecture's DEFAULT_TOKENIZER_ID from config.py
+    """
+    from config import DEFAULT_TOKENIZER_ID
+
+    if explicit:
+        return explicit, f"(--tokenizer {explicit})"
+    if os.path.isdir(ckpt):
+        # SFT checkpoints ship a chat-enabled tokenizer in the same folder.
+        if os.path.exists(os.path.join(ckpt, "tokenizer.json")):
+            return ckpt, "(tokenizer.json inside the checkpoint)"
+    return DEFAULT_TOKENIZER_ID, f"(default for this architecture)"
+
+
 @torch.no_grad()
 def score_choices(model, tokenizer, context: str, choices: list[str], device: str) -> list[float]:
-    """For each choice, compute log p(choice | context)."""
+    """For each choice, compute log p(choice | context).
+
+    Returns [] when every choice overflows the context window, so callers can
+    skip the example rather than scoring a truncated one.
+    """
     scores = []
     max_pos = getattr(model.config, "max_position_embeddings", 2048)
     ctx_ids = tokenizer(context, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
@@ -45,6 +76,10 @@ def score_choices(model, tokenizer, context: str, choices: list[str], device: st
         full = context + choice
         full_ids = tokenizer(full, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
         if full_ids.shape[1] > max_pos:
+            # This choice overflows. Mark it unusable rather than silently
+            # scoring a truncated string, which would be a free win or loss
+            # depending on where the cut landed.
+            scores.append(None)
             continue
         n_ctx = ctx_ids.shape[1]
         out = model(input_ids=full_ids, labels=None, chunk_size=0)
@@ -54,7 +89,7 @@ def score_choices(model, tokenizer, context: str, choices: list[str], device: st
         T = shift_labels.shape[0]
         n_choice = T - n_ctx + 1
         if n_choice <= 0:
-            scores.append(0.0)
+            scores.append(None)
             continue
         ce = torch.nn.functional.cross_entropy(
             shift_logits, shift_labels, reduction="none"
@@ -64,7 +99,28 @@ def score_choices(model, tokenizer, context: str, choices: list[str], device: st
     return scores
 
 
-def eval_hellaswag(model, tokenizer, device: str, limit=None, batch_size=8) -> dict:
+def _pick(gold: int, scores: list) -> int | None:
+    """Argmax over usable choices.
+
+    An overflowing choice scores None. Two behaviours matter here:
+
+    - If the GOLD answer overflowed, the example is unscorable. It must be
+      dropped (return None), not counted as wrong -- truncating the prompt
+      would have made it answerable, and silently dropping correct answers
+      biases the reported accuracy.
+    - If a DISTRACTOR overflowed, drop just that distractor and pick among the
+      rest. That is the standard partial-scoring treatment and it is fair:
+      the model is not being asked to score something it cannot represent.
+    """
+    usable = [(i, s) for i, s in enumerate(scores) if s is not None]
+    if not usable:
+        return None
+    if gold not in {i for i, _ in usable}:
+        return None
+    return max(usable, key=lambda t: t[1])[0]
+
+
+def eval_hellaswag(model, tokenizer, device: str, limit=None) -> dict:
     from datasets import load_dataset
     ds = load_dataset("Rowan/hellaswag", split="validation", trust_remote_code=True)
     if limit:
@@ -75,9 +131,9 @@ def eval_hellaswag(model, tokenizer, device: str, limit=None, batch_size=8) -> d
         endings = ex["endings"]
         label = int(ex["label"])
         scores = score_choices(model, tokenizer, ctx, endings, device)
-        if not scores:
+        pred = _pick(label, scores)
+        if pred is None:
             continue
-        pred = int(np.argmax(scores))
         if pred == label:
             correct += 1
         total += 1
@@ -101,9 +157,9 @@ def eval_arc(model, tokenizer, device: str, name: str, limit=None) -> dict:
         except ValueError:
             continue
         scores = score_choices(model, tokenizer, ctx, choices, device)
-        if not scores:
+        pred = _pick(gold, scores)
+        if pred is None:
             continue
-        pred = int(np.argmax(scores))
         if pred == gold:
             correct += 1
         total += 1
@@ -121,9 +177,9 @@ def eval_piqa(model, tokenizer, device: str, limit=None) -> dict:
         choices = [ex["sol1"], ex["sol2"]]
         gold = int(ex["label"])
         scores = score_choices(model, tokenizer, ctx, choices, device)
-        if not scores:
+        pred = _pick(gold, scores)
+        if pred is None:
             continue
-        pred = int(np.argmax(scores))
         if pred == gold:
             correct += 1
         total += 1
@@ -142,10 +198,15 @@ def eval_winogrande(model, tokenizer, device: str, limit=None) -> dict:
         ans = int(ex["answer"]) - 1
         s1 = ctx.replace("_", opt1)
         s2 = ctx.replace("_", opt2)
+        # The context is the full sentence with the blank filled in, so it is
+        # passed as "" and the two filled sentences ARE the choices. Scoring
+        # is the standard partial-sentence formulation: both options share
+        # the same prefix up to the blank, and the model scores the whole
+        # filled sentence.
         scores = score_choices(model, tokenizer, "", [s1, s2], device)
-        if not scores:
+        pred = _pick(ans, scores)
+        if pred is None:
             continue
-        pred = int(np.argmax(scores))
         if pred == ans:
             correct += 1
         total += 1
@@ -170,7 +231,6 @@ def main():
     from config import VortexArch, TokenizerProfile
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
     # Config MUST come from the checkpoint, not from defaults -- the vocab,
     # layer count and head count all differ between presets, and a default
@@ -180,11 +240,20 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
 
-    tok_vocab = len(tok)
-    if tok_vocab != cfg.vocab_size:
-        print(f"[eval] WARN: tokenizer has {tok_vocab:,} tokens but the model "
-              f"expects {cfg.vocab_size:,}. Scores will be wrong unless the "
-              f"tokenizer matches the one used in training.", flush=True)
+    tok_path, tok_src = resolve_tokenizer_path(args.ckpt, args.tokenizer)
+    tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+    print(f"[eval] tokenizer: {tok_path} {tok_src}", flush=True)
+
+    # A mismatch invalidates every score, so it is a hard error rather than a
+    # warning that scrolls past. The chat tokens SFT adds make the raw length
+    # legitimately exceed the pretrain vocab, so compare the BASE vocab.
+    base_vocab = getattr(tok, "vocab_size", len(tok))
+    if base_vocab != cfg.vocab_size:
+        print(f"[eval] ERROR: tokenizer vocab {base_vocab:,} != model vocab "
+              f"{cfg.vocab_size:,}. Scores would be meaningless.", flush=True)
+        print(f"[eval]        Pass the correct one: "
+              f"--tokenizer <path-or-hub-id>", flush=True)
+        sys.exit(1)
 
     print(f"[eval] model loaded: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params "
           f"({cfg.name_or_path}: {cfg.hidden_size}d x {cfg.num_hidden_layers}L, "
@@ -198,7 +267,7 @@ def main():
         print(f"[eval] running {task}...", flush=True)
         t0 = time.time()
         try:
-            r = EVAL_FNS[task](model, tok, device, limit=args.limit, batch_size=args.batch)
+            r = EVAL_FNS[task](model, tok, device, limit=args.limit)
             r["time_s"] = round(time.time() - t0, 1)
             results.append(r)
             print(f"  {task}: acc={r['acc']*100:.2f}%  n={r['n']}  ({r['time_s']}s)", flush=True)

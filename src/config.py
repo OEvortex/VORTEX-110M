@@ -336,10 +336,24 @@ class TokenizerProfile:
         tok = AutoTokenizer.from_pretrained(
             tok_id, token=os.environ.get("HF_TOKEN") or hub_token
         )
-        # Effective vocab = max(len(vocab), any special id) + 1, so an EOS
-        # living above len(tok) is still representable.
-        ids = [tok.bos_token_id or 0, tok.eos_token_id or 0, tok.pad_token_id or 0]
-        eff_vocab = max([len(tok)] + ids) + 1
+        # Effective vocab = the highest id the tokenizer can EMIT, plus one.
+        # This must be a size, not an index, so no `+ 1` beyond this point.
+        #
+        # The old form was `max(len(tok), *ids) + 1`, which over-counted by
+        # one: for a 16K vocab whose highest actual id is 16,383, it reported
+        # 16,385. That is not cosmetic -- pretrain.py adopts this number
+        # verbatim, so the embedding table was allocated 512 phantom rows
+        # (16,385 x 512) that no token can ever reach, and the param count
+        # was wrong. It also made a correct checkpoint look like a vocab
+        # mismatch to the eval guard.
+        #
+        # `len(tok)` already counts the added special tokens
+        # (<|pad|>..<|unk|>, ids 0-3), so it is the floor; the max over real
+        # ids guards the case where a special token sits above len(tok).
+        base = tok.get_vocab()
+        ids = [tok.bos_token_id, tok.eos_token_id, tok.pad_token_id]
+        ids = [i for i in ids if i is not None]
+        eff_vocab = max([len(tok), len(base)] + ids + [0])
         return cls(
             tokenizer_id=tok_id,
             vocab_size=eff_vocab,

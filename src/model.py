@@ -281,6 +281,45 @@ class VortexModel(PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def resize_token_embeddings(self, new_num_tokens: int):
+        """Grow the token embedding table to `new_num_tokens` rows.
+
+        Needed by SFT, which adds the ChatML control tokens (<|im_start|>,
+        <|im_end|>, <|endoftext|>) after pretraining. The table is TIED to
+        lm_head, so both sides must grow together or the output projection
+        will not cover the new ids.
+
+        New rows are initialized from N(0, initializer_range) -- the same
+        distribution the rest of the table was trained with -- rather than
+        zeros. A zeroed control token would produce a zero logit for that id,
+        and because ChatML training masks every prompt, the <|im_start|> rows
+        would receive gradient only on assistant turns. Zeros also make the
+        new tokens indistinguishable from each other at init.
+
+        Weights are NOT tied afterwards: the pretrained rows keep their
+        trained values while the new rows need to diverge, so lm_head becomes
+        a separate parameter. The caller must retie explicitly if it wants
+        memory saving back.
+        """
+        old = self.embed_tokens.weight
+        old_num, dim = old.shape
+        if new_num_tokens == old_num:
+            return old
+        if new_num_tokens < old_num:
+            raise ValueError(
+                f"cannot shrink token embeddings {old_num} -> {new_num_tokens}; "
+                f"the tokenizer must only be extended"
+            )
+
+        new = torch.nn.Embedding(new_num_tokens, dim).to(
+            device=old.device, dtype=old.dtype
+        )
+        with torch.no_grad():
+            new.weight.normal_(mean=0.0, std=self.cfg.initializer_range)
+            new.weight[:old_num].copy_(old)
+        self.embed_tokens = new
+        return new
+
     def _init_weights(self, module: nn.Module):
         std = self.cfg.initializer_range
         if isinstance(module, nn.Linear):
