@@ -1,55 +1,3 @@
-"""
-ChatML-style chat template for the Vortex models.
-
-Why ChatML
-----------
-The tokenizer is a plain 16K byte-level BPE with NO reserved control tokens, so
-a chat format has to be designed rather than inherited. ChatML is the right
-shape for it for one specific reason: it needs only FOUR new ids, and all four
-can be carved out of existing vocabulary without retraining the tokenizer.
-
-    <|im_start|>   start of a role block
-    <|im_end|>     end of a role block, and end of generation
-    <|endoftext|>  document separator (already exists as EOS)
-
-Roles are encoded as TEXT inside the block ("system", "user", "assistant")
-rather than as separate tokens. That is deliberate:
-
-  * 4 new ids instead of ~10 (`<|system|>`, `<|user|>`, ... would each cost an
-    id, and a 16K vocab has no ids to spare -- every one is a parameter).
-  * The role words are already high-frequency English tokens, so they are
-    nearly free at the BPE level.
-  * The model can still generalize to an unseen role string, which cannot
-    happen with a closed set of role tokens.
-
-Generation stops on `<|im_end|>`.
-
-Sequencing
------------
-A single rendered conversation looks like:
-
-    <|im_start|>system
-    You are a helpful assistant.<|im_end|>
-    <|im_start|>user
-    What is 2+2?<|im_end|>
-    <|im_start|>assistant
-    It is 4.<|im_end|>
-
-Note there is NO trailing newline after the final `<|im_end|>`. Generation
-appends `<|im_end|>` and stops; anything after it is not part of the target.
-
-Loss masking
-------------
-Only ASSISTANT content is trained on. The tokens of the prompt -- the
-`<|im_start|>` marker, the role word, and the whole user/system turn -- are
-labelled `-100`. The assistant's opening `<|im_start|>assistant` header IS
-trained, because the model has to learn to open its own turn; the closing
-`<|im_end|>` is trained so it learns to stop.
-
-Mismatched template and masking is the single most common SFT bug: train the
-prompt too and the model learns to echo questions before answering, and never
-learns to emit `<|im_end|>` so it rambles until the context fills.
-"""
 from __future__ import annotations
 
 IM_START = "<|im_start|>"
@@ -70,7 +18,6 @@ GENERATION_ROLE = "assistant"
 
 
 def build_chat_template() -> str:
-    """The Jinja chat template, for `tokenizer.apply_chat_template`."""
     return (
         "{% for message in messages %}"
         "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
@@ -82,11 +29,6 @@ def build_chat_template() -> str:
 
 
 def render(messages, add_generation_prompt: bool = False) -> str:
-    """Render a message list to the ChatML training string.
-
-    `messages` is [{"role": ..., "content": ...}, ...]. Raises on an unknown
-    role rather than silently training the model on a malformed turn.
-    """
     out = []
     for m in messages:
         role = m.get("role")
@@ -103,24 +45,10 @@ def render(messages, add_generation_prompt: bool = False) -> str:
 
 
 def render_prompt(messages) -> str:
-    """Render up to (but not including) the assistant's reply.
-
-    The trailing `<|im_start|>assistant\n` IS included, because that is what the
-    model conditions on when it starts generating.
-    """
     return render(messages, add_generation_prompt=True)
 
 
 def encode_example(tok, messages, max_len: int, train_on_last: bool = True):
-    """Tokenize one conversation into (input_ids, labels) with masking.
-
-    Returns None when the conversation does not fit or contains no trainable
-    assistant turn -- both are normal and should be filtered, not crashed on.
-
-    Masking rule, matching the docstring: every system/user turn, and the
-    `<|im_start|>role` headers, are -100. An assistant turn's content and its
-    closing `<|im_end|>` are trained.
-    """
     # Build the full text, remembering where each assistant span begins and
     # ends in CHARACTER space, then map to tokens. Working in character space
     # and converting once avoids the classic off-by-one where the header of
@@ -172,7 +100,6 @@ def encode_example(tok, messages, max_len: int, train_on_last: bool = True):
 
 
 def describe() -> str:
-    """Human-readable summary, printed at the top of an SFT run."""
     return (
         "ChatML template (Vortex)\n"
         f"  {IM_START}  role-block start   (also the generation header)\n"

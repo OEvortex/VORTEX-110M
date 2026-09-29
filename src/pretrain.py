@@ -1,18 +1,3 @@
-"""
-VTX-300M pretraining script.
-
-Trains the custom VTX-300M model (GQA, SwiGLU, RoPE, RMSNorm) on
-pre-tokenized memory-mapped data using bf16 mixed precision +
-torch.compile + AdamW. Pushes checkpoints to the configured Hub repo.
-
-Optimized for single-GPU training on RTX 5090 Blackwell (32GB VRAM).
-
-Usage:
-    python pretrain.py --config pretrain_config.json
-    python pretrain.py --steps 30000 --batch 8 --grad-accum 4 --block 2048 \
-        --shards path/to/shard_0000.bin path/to/shard_0001.bin ...
-    python pretrain.py --no-resume   # ignore checkpoints, start fresh
-"""
 from __future__ import annotations
 import os
 import sys
@@ -36,28 +21,6 @@ _STEP_DIR_RE = re.compile(r"step_(\d+)")
 
 
 def build_optimizer(model, args):
-    """AdamW with decoupled weight decay, param groups, and no WD on 1-D params.
-
-    Why AdamW and not Lion: Lion halves optimizer state but its update is
-    `sign(momentum)`, which throws away gradient magnitude. For a 2B-token run
-    on a 50M model AdamW's per-parameter scaling is the better-behaved default,
-    and the 2x state cost is irrelevant here -- fp32 moments for 49.5M params
-    is ~400MB against 24GB of VRAM.
-
-    Three settings that matter, and are easy to get wrong:
-
-    1. `decoupled_weight_decay=True`. Folding L2 into the gradient biases the
-       effective LR per parameter; the decoupled form is what weight_decay=0.1
-       actually means and it behaves correctly alongside the no-decay group.
-
-    2. No weight decay on 1-D params (norm gains). Decaying a gain vector
-       pulls it toward zero, fighting the RMSNorm rescale. Standard practice
-       (GPT-2 / LLaMA) and very easy to miss.
-
-    3. `fused=True`. The fused CUDA kernel runs the whole update in one pass
-       with no per-parameter Python loop -- a real win across ~130 tensors.
-       Falls back automatically on CPU.
-    """
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -87,7 +50,6 @@ def build_optimizer(model, args):
     print(f"[pretrain]   no_decay {n_nod/1e6:7.1f}M  wd=0.0 (norm gains)", flush=True)
     print(f"[pretrain]   state ~{(n_dec+n_nod)*8/1e9:.2f} GB fp32 moments", flush=True)
     return optim
-
 
 
 # Trackio for monitoring
@@ -165,16 +127,6 @@ def _vram_gb() -> float:
 
 
 def find_max_batch(build_step, params, block: int, cap: int = 256) -> tuple:
-    """Binary-search the largest per-device batch that completes a fwd+bwd step.
-
-    `build_step(bs)` must return a scalar loss for a batch of `bs` sequences.
-    An OOM is caught and treated as data rather than a crash, and
-    `empty_cache()` runs between probes -- a fragmented allocation would
-    otherwise make a size that actually fits look like a failure.
-
-    Returns (best_batch, log_lines). Returns 0 if even batch=1 OOMs, which
-    means --block is too long for this card.
-    """
     log = [f"probing batch 1..{cap} at block={block} on "
            f"{torch.cuda.get_device_name(0)} ({_vram_gb():.1f} GB)"]
 
@@ -258,7 +210,6 @@ def cosine_lr(step, warmup, total, base_lr, min_lr):
 
 
 def get_default_shards():
-    """Pull shard paths from the configured data Hub dataset."""
     from huggingface_hub import snapshot_download
     print("[pretrain] downloading data shards from Hub...", flush=True)
     local_data = snapshot_download(
@@ -272,11 +223,6 @@ def get_default_shards():
 
 
 def find_latest_checkpoint(save_dir):
-    """Find the latest checkpoint directory in save_dir.
-
-    Looks for step_N directories and returns (path, step_number) of the
-    highest-numbered one, or (None, 0) if nothing is found.
-    """
     if not os.path.isdir(save_dir):
         return None, 0
     candidates = []
@@ -302,14 +248,6 @@ def find_latest_checkpoint(save_dir):
 
 
 def read_state_step(path):
-    """Read the `step` field out of a training_state.pt.
-
-    A 50M-param AdamW checkpoint carries ~400MB of fp32 moments and
-    `torch.load` has no lazy-field mode, so the payload is materialized
-    whether or not the moments are wanted. All this saves is the optimizer
-    reconstruction -- it keeps the call site honest about needing one integer.
-    Returns None if the file is unreadable.
-    """
     try:
         state = torch.load(path, map_location="cpu", weights_only=False)
         return int(state["step"])
@@ -324,18 +262,6 @@ def _weights_present(d):
 
 
 def fetch_hub_checkpoint(repo_id, token=None, save_dir=None):
-    """Download a resumable checkpoint from a Hub model repo.
-
-    Checkpoints are pushed to the Hub as a FLAT snapshot -- `model.safetensors`,
-    `config.json`, `training_state.pt` and the tokenizer files all sit at the
-    repo root, because `api.upload_folder(folder_path=ckpt, ...)` preserves no
-    directory structure. There is therefore no `step_3000/` prefix to read a
-    step number from; the step lives INSIDE `training_state.pt`, so it is
-    fetched first and used to name the destination directory.
-
-    Returns (path, step) for a checkpoint safe to resume from, or (None, 0)
-    if the repo is unreachable or unusable as a resume point.
-    """
     import shutil
 
     from huggingface_hub import hf_hub_download, list_repo_files
@@ -431,18 +357,6 @@ def fetch_hub_checkpoint(repo_id, token=None, save_dir=None):
 
 
 def resolve_resume_point(args):
-    """Decide which checkpoint to resume from, local first, then the Hub.
-
-    Local wins by default: a local step_N is either this machine's own newer
-    work or the same Hub snapshot already staged, and re-downloading 600MB to
-    end up at an older step would be a regression, not a resume. The Hub is
-    consulted exactly when the local directory cannot supply a usable
-    checkpoint -- a fresh box, a wiped volume, or a preemption that lost the
-    scratch disk.
-
-    `--no-resume` short-circuits everything here, including the Hub: it means
-    "do not continue anyone's run", not "continue from somewhere else".
-    """
     if getattr(args, "no_resume", False):
         path, _ = find_latest_checkpoint(args.save_dir)
         if path is not None:
@@ -473,16 +387,6 @@ def resolve_resume_point(args):
 
 
 def _detach_rng_state(obj):
-    """Coerce anything RNG-shaped into a contiguous CPU uint8 ByteTensor.
-
-    torch.save/load round-trips the state correctly, but the LOAD side is
-    the trap: `torch.load(..., map_location=device)` on a GPU box
-    deserializes the saved CPU ByteTensor as a CUDA tensor, and
-    `torch.random.set_rng_state` accepts only a CPU ByteTensor. Callers get
-    `TypeError: RNG state must be a torch.ByteTensor` from deep inside
-    torch/random.py, which reads like a corrupted checkpoint rather than a
-    device-placement mismatch.
-    """
     if obj is None:
         return None
     if isinstance(obj, torch.Tensor):
@@ -495,14 +399,6 @@ def _detach_rng_state(obj):
 
 
 def restore_rng(rng):
-    """Best-effort restore of every RNG stream a checkpoint carries.
-
-    Each stream is independent and non-fatal: failing to restore one costs
-    exact reproducibility of the next few steps, not the run itself. That
-    matters because the torch stream is a ByteTensor whose device depends on
-    the loader, and checkpoints written by older builds may not carry the
-    python/numpy streams at all.
-    """
     if not rng:
         return
 
@@ -538,7 +434,6 @@ def restore_rng(rng):
 
 def save_checkpoint(model, optim, step, args, losses, val_history=None,
                     best_val=None):
-    """Save model + optimizer + RNG + history to a checkpoint directory."""
     ckpt = os.path.join(args.save_dir, f"step_{step}")
     os.makedirs(ckpt, exist_ok=True)
     save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -567,14 +462,6 @@ def save_checkpoint(model, optim, step, args, losses, val_history=None,
 
 
 def load_checkpoint(ckpt_path, model, optim, device):
-    """Load optimizer state, RNG streams, history, and step from a checkpoint.
-
-    Model weights are assumed already loaded by from_pretrained.
-    Returns a dict with the step to resume from (the step AFTER the saved one)
-    plus the restored loss/validation history, so the final train-vs-val
-    report and the overfit streak counter span the whole run instead of
-    starting over blank at the resume point.
-    """
     empty = {"step": 0, "losses": [], "val_history": [], "best_val": None}
     state_file = os.path.join(ckpt_path, "training_state.pt")
     if not os.path.exists(state_file):
@@ -636,20 +523,6 @@ def main():
         return x[:, :-1], x[:, 1:]
 
     def make_loader(epoch: int):
-        """Build the training loader for a given data-stream epoch.
-
-        `worker_init_fn` is load-bearing, not boilerplate. MMapDataset seeds a
-        single RNG in __init__, and forked workers inherit that state verbatim
-        -- so all 8 workers draw the IDENTICAL sample sequence. The interleaved
-        batches are then the same block 8 times over: an 8x cut in the unique
-        data actually seen, completely silent. `set_epoch` already folds the
-        worker id into its seed, so re-seeding per worker is all it takes.
-
-        The loader is built lazily (after the checkpoint load) so the epoch can
-        be seeded from the resumed step. Workers fork and freeze their RNG at
-        first iteration, so a loader seeded before the resume would replay the
-        blocks the interrupted run already trained on.
-        """
         ds.set_epoch(epoch)
 
         def _init_worker(_):

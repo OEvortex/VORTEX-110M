@@ -1,34 +1,3 @@
-"""
-Supervised fine-tuning (SFT) for the Vortex models.
-
-Takes a pretrained checkpoint, adds the ChatML control tokens, and trains on
-(prompt, response) pairs with the loss masked to the ASSISTANT SPAN ONLY.
-
-Usage:
-    # 30M tokens, ~1 epoch over a filtered slice
-    python sft.py --base VTXAI/vortex-50m-16k \
-        --tokenizer /root/vortex-tok-16k \
-        --dataset HuggingFaceTB/smol-smoltalk \
-        --max-tokens 30_000_000 \
-        --out-dir /root/vortex_50m_sft \
-        --hub-repo VTXAI/vortex-50m-16k-sft \
-        --lr 3e-5 --epochs 2
-
-Why the defaults are conservative
-----------------------------------
-A 50M model is destroyed far more easily by a wrong SFT LEARNING RATE than by
-a wrong token count. The pretrained peak is 6e-4; that LR will wreck a small
-model in a few hundred steps and the loss curve will not look obviously wrong
-until it is too late. 3e-5 is ~20x below the pretrain peak, which is the
-standard band for full fine-tuning a small base.
-
-Why masking is the whole game
------------------------------
-If the prompt tokens are also trained on, the model learns to emit the user's
-question before answering it, and it never learns to produce <|im_end|>, so it
-rambles until the context is full. The loss must cover the assistant content
-and its closing marker, and nothing else. See chat_template.encode_example.
-"""
 from __future__ import annotations
 
 import argparse
@@ -54,12 +23,6 @@ from pretrain import (build_optimizer, cosine_lr, fetch_hub_checkpoint,
 # Data
 # ──────────────────────────────────────────────────────────────────────
 def normalize_messages(raw):
-    """Coerce one dataset row into a clean ChatML message list.
-
-    Handles the three shapes in the wild: a `messages` list of dicts, a
-    single instruction row (dolly-style), and an instruction/input/output
-    triple. Returns None when nothing usable is present.
-    """
     if isinstance(raw, dict) and "messages" in raw and raw["messages"]:
         msgs = [
             {"role": m.get("role", "user"), "content": m.get("content", "")}
@@ -90,13 +53,6 @@ def normalize_messages(raw):
 
 
 class SFTDataset(IterableDataset):
-    """Yields (input_ids, labels) with the prompt masked to -100.
-
-    Streams the HuggingFace dataset (it is far too large to materialize) and
-    encodes on the fly. A conversation that overflows `block_size` or has no
-    trainable assistant token is SKIPPED, not truncated: truncating would
-    chop off the closing <|im_end|> and train the model never to stop.
-    """
 
     def __init__(self, dataset, tokenizer, block_size=1024, seed=0,
                  max_tokens=None, epochs=1, val_frac=0.02):
@@ -143,10 +99,6 @@ class SFTDataset(IterableDataset):
 
 
 def collate(batch):
-    """Right-pad a batch to the longest sequence and mask the padding.
-
-    Labels pad with -100 (ignored by the loss) and ids pad with the pad id.
-    """
     maxlen = max(len(ids) for ids, _ in batch)
     pad = 0
     input_ids, labels, attn = [], [], []
@@ -169,12 +121,6 @@ def build_tokenizer(tok_dir):
 
 
 def add_chat_tokens(tok):
-    """Register the ChatML control tokens on the tokenizer.
-
-    They are ADDED tokens (appended past the learned BPE ids), so existing
-    pretraining ids are untouched and the pretrained embedding rows keep their
-    trained meaning. Returns (new_token_ids, im_end_id).
-    """
     new_ids = tok.add_special_tokens({"additional_special_tokens": CT.SPECIAL_TOKENS})
     im_end_id = tok.convert_tokens_to_ids(CT.IM_END)
     return new_ids, im_end_id

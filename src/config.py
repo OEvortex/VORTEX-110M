@@ -1,55 +1,3 @@
-"""
-Vortex — from-scratch decoder-only Transformer, capped at <= 50M parameters.
-
-TARGET CORPUS: ENGLISH ONLY
-===========================
-The vocab is sized for English, not for Qwen-style multilingual text. With a
-tied embedding table the vocab is the biggest single lever on the budget:
-
-    vocab      hidden    embed table   vs a 50M budget
-    151,670    512       77.7M         155%  (impossible)
-    151,670    768      116.5M         233%  (impossible)
-     32,768    512       16.8M          34%  (width is now the limit)
-     16,384    512        8.4M          17%  (depth is now the limit)
-      8,192    640        5.2M          11%  (12 layers, 49.99M total)
-Note the constraint FLIPS as the vocab shrinks. At 32K the embedding table
-dominates and hidden size is capped. At 8K the table is nearly free, so the
-same 50M budget buys a WIDER model (640d) instead of more parameters spent on
-a lookup table. That is the whole point of training a small English vocab: it
-converts embedding parameters into transformer capacity.
-
-8K-16K is the proven band for English-only models at this scale -- TinyStories
-trains 1M-33M English models on a 10K vocabulary with excellent results.
-
-The trade-off, stated plainly: a smaller vocab compresses English less
-efficiently, so the same corpus yields more tokens. On English prose a 32K
-byte-level BPE lands around 4.0-4.5 chars/token, and 8K-16K lands around
-3.2-3.8. Run `train_tokenizer.py --stats` to measure it on YOUR corpus before
-committing -- the parameter win is certain, the token-efficiency cost is
-corpus-specific.
-
-If you ever add code or non-English text, switch to the `vortex-50m-32k`
-preset and retrain the tokenizer; do not try to serve a 16K vocab on
-English+code+multilingual text, the rare tokens will fragment badly.
-
-Everything here is written from scratch: no HuggingFace architecture class is
-ported. The component choices are the ones empirically validated on modern
-small LMs (GPT-2 -> Llama -> Qwen3 lineage):
-
-  * Pre-LN residual stream (stable deep stacks)
-  * RMSNorm (no mean subtraction, no bias)
-  * RoPE (relative position, no learned positional table)
-  * GQA (KV cache memory scales with n_kv_heads, not n_heads)
-  * QK-Norm (LLaMA-3 / Qwen3) -- the single most important trick for
-    training stability at small scale: it stops the attention-logit entropy
-    collapse that quietly wrecks small models.
-  * SwiGLU MLP
-  * Strictly TIED embeddings (saves an entire vocab*hidden matrix)
-  * Zero-initialized residual output projections (GPT-2 style): every block
-    starts as identity, so the untrained network is a clean passthrough and
-    deep stacks don't blow up.
-  * No biases anywhere in the projections.
-"""
 
 from __future__ import annotations
 
@@ -63,22 +11,6 @@ from typing import Dict, Optional
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class VortexArch:
-    """Architecture hyperparameters for a decoder-only Transformer.
-
-    Defaults mirror the `vortex-50m-16k` preset and land at **49,844,992 params**
-    (tied embeddings, vocab=16,384). `n_params()` is an exact analytic count
-    that matches the real module tree parameter-for-parameter.
-
-    Param budget for the default preset:
-        embedding (tied, counted once)   8.39M   16.8%
-        18 x decoder block               2.30M    4.6%  (41.45M total)
-        final norm                          0.00M
-        ----------------------------------------------------
-        total                            49.84M  100%
-
-    83% of the budget sits in transformer layers rather than a lookup table --
-    the direct payoff of the 16K English vocabulary.
-    """
 
     # ── Shape ────────────────────────────────────────────────────────
     # Defaults mirror the `vortex-50m-16k` preset: 16,384 English tokens.
@@ -125,11 +57,6 @@ class VortexArch:
 
     # ── Param accounting ─────────────────────────────────────────────
     def n_params(self) -> int:
-        """Exact parameter count of the implemented module tree.
-
-        Mirrors the tensor shapes in model.py one-for-one, so
-        `VortexArch.n_params() == sum(p.numel() for p in model.parameters())`.
-        """
         hs = self.hidden_size
         nh = self.num_attention_heads
         nkv = self.num_key_value_heads
@@ -155,7 +82,6 @@ class VortexArch:
         return n
 
     def param_breakdown(self) -> Dict[str, int]:
-        """Human-readable split of the parameter budget."""
         hs = self.hidden_size
         nh = self.num_attention_heads
         nkv = self.num_key_value_heads
@@ -199,7 +125,6 @@ class VortexArch:
         self.validate()
 
     def validate(self) -> None:
-        """Raise if the shape is internally inconsistent."""
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
                 f"hidden_size {self.hidden_size} not divisible by "
@@ -224,7 +149,6 @@ class VortexArch:
 
     @classmethod
     def from_name(cls, name: str) -> "VortexArch":
-        """Build a preset by name, e.g. `VortexArch.from_name("vortex-50m")`."""
         key = name.lower().replace("_", "-")
         if key not in PRESETS:
             raise KeyError(f"Unknown preset {name!r}. Available: {sorted(PRESETS)}")
@@ -314,12 +238,6 @@ DEFAULT_TOKENIZER_ID = "VTXAI/vortex-tok-16k"
 
 @dataclass
 class TokenizerProfile:
-    """Special-token ids + vocab size for the model's tokenizer.
-
-    Loaded from a local tokenizer directory (the one train_tokenizer.py
-    writes) or a Hub id. `vocab_size` is authoritative for the model config
-    and MUST match the tokenizer used to build the `.bin` shards.
-    """
     tokenizer_id: str = DEFAULT_TOKENIZER_ID
     vocab_size: int = 16_384
     bos_token_id: int = 1

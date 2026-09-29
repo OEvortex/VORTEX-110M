@@ -1,37 +1,3 @@
-"""
-Vortex — a from-scratch decoder-only Transformer (no HF architecture ported).
-
-Written from first principles on top of `torch.nn`. The only HuggingFace
-surface used is the `PreTrainedModel` / `PretrainedConfig` wrapper, purely so
-the checkpoint serializes with `save_pretrained()` and loads with
-`from_pretrained()`. Every tensor below is hand-defined.
-
-Component stack
----------------
-    RMSNorm            pre-norm, no mean subtraction, no bias
-    RoPE               rotary position embedding, cached in fp32
-    GQA + SDPA         grouped-query attention on FlashAttention-2 kernels
-    QK-Norm            per-head RMSNorm on q/k before the matmul
-    SwiGLU MLP         gate/up/down, no bias
-    tied embeddings    lm_head.weight IS embed_tokens.weight
-    zero-init residual o_proj/down_proj start at exactly zero
-
-Two stability choices are worth calling out because they matter far more at
-50M params than they do at 7B:
-
-1. QK-Norm. Without it, small models hit *attention entropy collapse* early
-   in training: a few heads saturate, their softmax goes one-hot, gradients
-   vanish, and those heads are dead for the rest of the run. Normalizing q
-   and k per-head bounds the pre-softmax logits and removes the failure mode.
-
-2. Zero-initialized residual outputs. With Pre-LN, each block adds
-   `attn(ln(x))` to the stream. If that output is non-zero at init, 12-24
-   stacked blocks compound their variances and the residual stream
-   saturates before training starts. Zeroing o_proj/down_proj makes every
-   block an exact identity at init: the untrained network is a clean
-   passthrough (up to the embedding), which is what GPT-2 did deliberately
-   and what stable-stack work since confirmed.
-"""
 
 from __future__ import annotations
 
@@ -69,12 +35,6 @@ class VortexConfig(PretrainedConfig):
 # Norm
 # ──────────────────────────────────────────────────────────────────────
 class VortexRMSNorm(nn.Module):
-    """RMSNorm:  y = x / sqrt(mean(x^2) + eps) * w
-
-    Computed in fp32 regardless of input dtype, then cast back -- the naive
-    bf16 version loses enough precision in the mean-square that small
-    models see a visibly noisier residual stream.
-    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -96,11 +56,6 @@ class VortexRMSNorm(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 def build_rope_cache(head_dim: int, max_seq_len: int, base: float,
                      device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Precompute (cos, sin) each of shape (max_seq_len, head_dim // 2).
-
-    Kept in fp32 then cast: RoPE phase error compounds across positions, and
-    computing the table in bf16 visibly degrades long-context behaviour.
-    """
     if head_dim % 2 != 0:
         raise ValueError(f"head_dim must be even, got {head_dim}")
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
@@ -110,15 +65,6 @@ def build_rope_cache(head_dim: int, max_seq_len: int, base: float,
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate q/k on their last dim. x is (B, H, T, D), cos/sin are (T, D/2).
-
-    split-half convention (GPT-NeoX):
-        out1 = x1*cos - x2*sin
-        out2 = x2*cos + x1*sin
-    with x1, x2 = x.chunk(2, -1). Equivalent to the interleaved formulation
-    under a permutation of the head dim, and cheaper (one cat, no strided
-    write).
-    """
     T = x.shape[-2]
     cos = cos[:T].unsqueeze(0).unsqueeze(0)               # (1, 1, T, D/2)
     sin = sin[:T].unsqueeze(0).unsqueeze(0)
@@ -130,17 +76,6 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 # Attention
 # ──────────────────────────────────────────────────────────────────────
 class VortexAttention(nn.Module):
-    """Grouped-query self-attention: RoPE + optional QK-Norm + causal SDPA.
-
-    GQA: `num_attention_heads` Q heads share `num_key_value_heads` KV heads,
-    cutting KV-cache size (and the K/V projection params) by
-    n_heads/n_kv_heads. In this config 8 Q heads read from 2 KV heads -> 4x
-    smaller cache, 262K fewer params per layer.
-
-    We rely on SDPA's `enable_gqa` where available so KV heads are never
-    physically materialized; the repeat_interleave path is the fallback for
-    older torch.
-    """
 
     def __init__(self, cfg: VortexConfig):
         super().__init__()
@@ -217,12 +152,6 @@ class VortexAttention(nn.Module):
 # MLP
 # ──────────────────────────────────────────────────────────────────────
 class VortexMLP(nn.Module):
-    """SwiGLU:  y = down( silu(gate(x)) * up(x) ).
-
-    The gate/up split is why `intermediate_size` is ~2.6x hidden rather than
-    4x: the parameter count matches a 4x ReLU MLP while running two
-    matmuls instead of one.
-    """
 
     def __init__(self, cfg: VortexConfig):
         super().__init__()
@@ -239,7 +168,6 @@ class VortexMLP(nn.Module):
 # Block
 # ──────────────────────────────────────────────────────────────────────
 class VortexBlock(nn.Module):
-    """Pre-LN block:  x += attn(ln_attn(x));  x += mlp(ln_mlp(x))."""
 
     def __init__(self, cfg: VortexConfig):
         super().__init__()
@@ -282,25 +210,6 @@ class VortexModel(PreTrainedModel):
         self.embed_tokens = value
 
     def resize_token_embeddings(self, new_num_tokens: int):
-        """Grow the token embedding table to `new_num_tokens` rows.
-
-        Needed by SFT, which adds the ChatML control tokens (<|im_start|>,
-        <|im_end|>, <|endoftext|>) after pretraining. The table is TIED to
-        lm_head, so both sides must grow together or the output projection
-        will not cover the new ids.
-
-        New rows are initialized from N(0, initializer_range) -- the same
-        distribution the rest of the table was trained with -- rather than
-        zeros. A zeroed control token would produce a zero logit for that id,
-        and because ChatML training masks every prompt, the <|im_start|> rows
-        would receive gradient only on assistant turns. Zeros also make the
-        new tokens indistinguishable from each other at init.
-
-        Weights are NOT tied afterwards: the pretrained rows keep their
-        trained values while the new rows need to diverge, so lm_head becomes
-        a separate parameter. The caller must retie explicitly if it wants
-        memory saving back.
-        """
         old = self.embed_tokens.weight
         old_num, dim = old.shape
         if new_num_tokens == old_num:
@@ -386,13 +295,6 @@ class VortexForCausalLM(PreTrainedModel):
         labels: Optional[torch.Tensor] = None,
         chunk_size: int = 0,
     ):
-        """Returns an object with `.logits` and `.loss`.
-
-        `logits` is only materialized when no labels are given. With labels
-        the loss is accumulated in time-chunks, because materializing
-        (B, T, 32768) logits for a full batch is the single largest memory
-        term in the step and is entirely avoidable.
-        """
         hidden = self.model(input_ids)
 
         if labels is None:
@@ -406,7 +308,6 @@ class VortexForCausalLM(PreTrainedModel):
 
     def _chunked_ce(self, hidden: torch.Tensor, labels: torch.Tensor,
                     chunk: int) -> torch.Tensor:
-        """Sum-reduced cross-entropy over time-chunks (memory-lean)."""
         n_valid = (labels != -100).sum()
         if n_valid.item() == 0:
             return hidden.sum() * 0.0     # keeps the graph connected
@@ -454,7 +355,6 @@ class VortexForCausalLM(PreTrainedModel):
             nn.init.ones_(module.weight)
 
     def _zero_init_residuals(self):
-        """Zero the residual output projections so every block starts as identity."""
         if not getattr(self.cfg, "zero_init_residual", True):
             return
         for layer in self.model.layers:
@@ -477,7 +377,6 @@ class VortexForCausalLM(PreTrainedModel):
 
 
 class CausalLMOutput:
-    """Minimal stand-in so we don't depend on a transformers output class."""
     __slots__ = ("logits", "loss")
 
     def __init__(self, logits: Optional[torch.Tensor], loss: Optional[torch.Tensor]):

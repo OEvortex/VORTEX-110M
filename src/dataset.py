@@ -1,9 +1,3 @@
-"""
-Memory-mapped pre-tokenized dataset loader.
-
-Reads one or more `.bin` files (uint32 little-endian token stream with
-EOS-separated documents) and yields fixed-length blocks for training.
-"""
 from __future__ import annotations
 import numpy as np
 import torch
@@ -13,12 +7,6 @@ from typing import List, Optional
 
 
 class MMapDataset(IterableDataset):
-    """Stream fixed-length blocks of tokens from a list of memmap shards.
-
-    Shards are concatenated logically; samples start at random offsets.
-    Each sample is a (block_size+1,) tensor of int64 token ids (for input
-    and target).
-    """
     def __init__(
         self,
         shard_paths: List[str],
@@ -64,7 +52,6 @@ class MMapDataset(IterableDataset):
         self._rng = np.random.default_rng(self._seed + epoch * 1000 + wid)
 
     def _locate(self, global_idx: int) -> tuple[np.memmap, int]:
-        """Map a global token index to (mmap, local_index)."""
         # offsets is cumulative; find shard via bisect
         import bisect
         shard_idx = bisect.bisect_right(self.offsets, global_idx) - 1

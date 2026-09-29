@@ -1,31 +1,3 @@
-"""
-Competition evaluation for Vortex: lm-evaluation-harness + WikiText-103 PPL.
-
-This is THE scoring script. It produces the two numbers the submission is
-judged on:
-
-  1. HellaSwag, ARC-Easy, PIQA, WinoGrande  (via EleutherAI lm-evaluation-harness)
-  2. Perplexity on a held-out slice of WikiText-103
-
-Everything is done with a MODEL WEIGHTS LOADED FROM DISK. No hosted API is
-contacted at any point.
-
-Why lm-eval-harness and not the hand-rolled scorer
---------------------------------------------------
-`eval_benchmarks.py` implements its own multiple-choice scoring. That is fine
-for a smoke test but it is NOT comparable to published numbers, and the
-submission is scored with the harness. Length normalization alone changes
-HellaSwag by several points, so the two must never be mixed. This script is the
-authority; `eval_benchmarks.py` is only a fallback if the harness is absent.
-
-Usage:
-    # full run (this is what the README numbers come from)
-    python eval_competition.py --ckpt /root/vortex_50m_ckpt/step_15258 \
-        --tokenizer /root/vortex-tok-16k --out vortex_eval.json
-
-    # quick smoke before committing a GPU-hour
-    python eval_competition.py --ckpt ... --tokenizer ... --limit 200 --smoke
-"""
 from __future__ import annotations
 
 import argparse
@@ -73,12 +45,6 @@ def parse_args():
 # Model loading
 # ──────────────────────────────────────────────────────────────────────
 def load_model_and_tokenizer(ckpt, tok_arg, device):
-    """Load the checkpoint and its MATCHING tokenizer.
-
-    The vocab check is a hard error, not a warning. A tokenizer with different
-    ids produces plausible-looking but meaningless scores, and a 16K model
-    scored with an 8K tokenizer cannot even represent its own output ids.
-    """
     from model import VortexForCausalLM
     from config import DEFAULT_TOKENIZER_ID
 
@@ -133,11 +99,6 @@ def load_model_and_tokenizer(ckpt, tok_arg, device):
 # 1. lm-evaluation-harness
 # ──────────────────────────────────────────────────────────────────────
 def run_lm_eval(model, tok, tasks, limit, batch):
-    """Score with EleutherAI's harness, matching the grader's methodology.
-
-    Falls back to None (not an exception) so the caller can decide: a missing
-    harness should not abort the whole evaluation, it should be loud.
-    """
     try:
         from lm_eval import simple_evaluate
         from lm_eval.models.huggingface import HFLM
@@ -164,15 +125,6 @@ def run_lm_eval(model, tok, tasks, limit, batch):
 # 2. WikiText-103 perplexity
 # ──────────────────────────────────────────────────────────────────────
 def wikitext_ppl(model, tok, n_lines, batch_size=8, device="cuda"):
-    """Token-level perplexity on held-out WikiText-103.
-
-    Sliding non-overlapping windows of the model's context, exactly like
-    pretraining. Reports the standard word-level `perplexity` (exp of mean NLL
-    per TOKEN, which is what every LM leaderboard means) and the raw bits per
-    byte for reference.
-
-    The corpus is the `test` split so it cannot overlap the training shards.
-    """
     from datasets import load_dataset
 
     # `Salesforce/wikitext` is the canonical home of the corpus; the bare

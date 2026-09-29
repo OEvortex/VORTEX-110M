@@ -1,9 +1,3 @@
-"""
-Verification suite for the Vortex <=50M architecture.
-
-Run:  python verify_arch.py
-Exits non-zero on any failure, so it can gate a training launch.
-"""
 
 from __future__ import annotations
 

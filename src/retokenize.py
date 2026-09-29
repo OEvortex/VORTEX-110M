@@ -1,23 +1,3 @@
-"""
-Re-tokenize a corpus into `uint32` memmap shards for the Vortex tokenizer.
-
-Changing the tokenizer invalidates every existing `.bin` shard -- the token
-ids in them mean something different under the new vocab. This script walks
-the raw corpus, encodes each document with the new tokenizer, and writes
-EOS-separated shards in exactly the format `dataset.MMapDataset` expects:
-
-    uint32 little-endian, documents separated by <|eos|>
-
-Output is sharded at roughly `--tokens-per-shard` tokens so shards stay a
-manageable size for memmapping and can stream to the Hub independently.
-
-Usage
------
-    python retokenize.py \
-        --tokenizer ./vortex-tok-16k \
-        --out ./data32k \
-        /path/to/corpus/*.jsonl
-"""
 
 from __future__ import annotations
 
@@ -35,7 +15,6 @@ from train_tokenizer import iter_text_files, iter_hf_text  # noqa: E402
 
 # ──────────────────────────────────────────────────────────────────────
 class ShardWriter:
-    """Streams encoded token ids into fixed-size uint32 `.bin` shards."""
 
     def __init__(self, out_dir: Path, tokens_per_shard: int = 100_000_000,
                  prefix: str = "shard"):
@@ -57,7 +36,6 @@ class ShardWriter:
             self._flush(self.tokens_per_shard)
 
     def add_doc(self, ids: List[int], eos_id: int) -> None:
-        """Append one document followed by its EOS boundary, as one unit."""
         self.total_docs += 1
         self.add(list(ids) + [eos_id])
 
@@ -93,7 +71,6 @@ class ShardWriter:
 
 # ──────────────────────────────────────────────────────────────────────
 def batch_encode(tok, docs: List[str], batch_size: int = 1000) -> Iterator[List[int]]:
-    """Encode in batches -- a single-document loop wastes the Rust threads."""
     for i in range(0, len(docs), batch_size):
         chunk = docs[i:i + batch_size]
         for enc in tok.encode_batch(chunk):
@@ -164,7 +141,6 @@ def _flush_docs(tok, docs: List[str], eos_id: int, writer: ShardWriter,
 
 
 def _eos_id(tok_dir: Path, tok: Tokenizer) -> int:
-    """Resolve the EOS id, preferring the trained config's mapping."""
     cfg_path = tok_dir / "tokenizer_config.json" if tok_dir.is_dir() else None
     if cfg_path and cfg_path.exists():
         cfg = json.loads(cfg_path.read_text())

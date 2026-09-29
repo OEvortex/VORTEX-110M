@@ -1,4 +1,3 @@
-"""Minimal FastAPI server for sandbox operations."""
 import hmac, os, subprocess, pathlib, signal, threading, re, tempfile
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -33,7 +32,6 @@ def _truncate_output(output: str, max_chars: int = 25000, head_ratio: float = 0.
     return head + meta + tail
 
 def _atomic_write(path: pathlib.Path, content: str):
-    """Write atomically: temp file + fsync + os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = None
     tmp_path = None
@@ -116,7 +114,6 @@ def _normalize_unicode(s):
     return "".join(UNICODE_MAP.get(c, c) for c in s)
 
 def _fuzzy_find_original(content, pattern):
-    """Find the original text in content that matches pattern fuzzily."""
     if pattern in content:
         return pattern, None
     # Pass 2: right-trim
@@ -150,7 +147,6 @@ def _fuzzy_find_original(content, pattern):
     return None, None
 
 def _apply_edit(content, old_str, new_str, mode="replace", replace_all=False):
-    """Apply edit. Returns (new_content, count, fuzzy_note) or raises ValueError."""
     if mode == "replace_all":
         replace_all = True
         mode = "replace"
@@ -180,12 +176,6 @@ def _apply_edit(content, old_str, new_str, mode="replace", replace_all=False):
     raise ValueError(f"Unknown mode: {mode}")
 
 def _validate_python(content, path=""):
-    """Validate Python: syntax, kwargs against real installed signatures, training heuristics.
-
-    Runs inside the sandbox where packages are pip-installed, so we can actually
-    import classes and inspect their __init__ signatures to catch kwarg mismatches
-    before runtime.
-    """
     import ast as _ast, inspect as _inspect, importlib as _il
     warnings = []
 
@@ -291,7 +281,6 @@ def bash(req: BashReq):
 
 @app.post("/api/kill", dependencies=_AUTH)
 def kill_all():
-    """Kill all active bash processes. Called when user cancels."""
     with _proc_lock:
         pids = list(_active_procs.keys())
     killed = []

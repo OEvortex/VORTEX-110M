@@ -1,42 +1,3 @@
-"""
-Train the Vortex tokenizer -- an 8,192-token BPE for ENGLISH-ONLY text.
-
-Why this file has to exist
---------------------------
-The original tokenizer was Qwen3's 151,670-token vocabulary. With tied
-embeddings that vocab costs `vocab * hidden` parameters in a single table:
-
-    151,670 x 512 = 77.7M   (155% of a 50M budget, before a single layer)
-
-For English-only training that is pure waste: most of those 151K merges are
-multilingual scripts, emoji, and CJK that will never appear in your corpus.
-An 8,192-token English BPE costs 5.2M at hidden=640, freeing the rest of the
-budget for the transformer itself.
-
-8K-16K is the proven band for English at this scale -- TinyStories trains
-1M-33M English models on a 10K vocabulary.
-
-The trade-off you are making explicitly: a smaller vocab compresses English
-less efficiently, so the same corpus yields MORE tokens. On English prose a
-32K byte-level BPE lands around 4.0-4.5 chars/token; 8K-16K lands around
-3.2-3.8. The parameter win is large and certain, the token-efficiency cost is
-corpus-specific -- measure it with `--stats` before committing.
-
-If you ever add code or non-English text, retrain at 32768 and switch to the
-`vortex-50m-32k` preset. Rare tokens fragment badly in a 8K English vocab.
-
-Usage
------
-    # Train on a directory of .jsonl / .txt / .parquet
-    python train_tokenizer.py --out ./vortex-tok-8k --vocab-size 8192
-
-    # Then report compression stats before committing to a full retokenize
-    python train_tokenizer.py --out ./vortex-tok-8k --stats
-
-Then re-tokenize the corpus and train:
-    python retokenize.py --tokenizer ./vortex-tok-8k --out ./data8k
-    python pretrain.py --arch vortex-50m --tokenizer ./vortex-tok-8k --shards ./data8k/shard_*.bin
-"""
 
 from __future__ import annotations
 
@@ -62,10 +23,6 @@ TEXT_KEYS = ("text", "content", "document", "raw", "body", "source")
 
 
 def iter_text_files(paths: List[str], limit_bytes: Optional[int] = None) -> Iterator[str]:
-    """Yield raw document text from .jsonl / .txt / .parquet / .json.
-
-    Streams line by line so a multi-GB corpus never lands in memory.
-    """
     for raw_path in paths:
         path = Path(raw_path)
         if path.is_dir():
@@ -103,7 +60,6 @@ def iter_text_files(paths: List[str], limit_bytes: Optional[int] = None) -> Iter
 
 
 def _iter_structured(f: Path) -> Iterator[str]:
-    """Pull text out of .json arrays or .parquet datasets."""
     if f.suffix == ".json":
         with open(f, "r", encoding="utf-8", errors="replace") as fh:
             data = json.load(fh)
@@ -152,14 +108,6 @@ def iter_hf_text(repo: str = HF_REPO,
                  max_docs: Optional[int] = None,
                  text_key: str = "text",
                  seed: int = 42) -> Iterator[str]:
-    """Stream raw text documents from a Hub dataset without downloading it.
-
-    Uses `streaming=True`, so memory stays flat regardless of dataset size --
-    essential for a 122-550 GB corpus. Shuffles the file order with a fixed
-    seed so `--max-docs` samples the whole corpus rather than always reading
-    shard 0 (cosmopedia is ordered by topic, so unshuffled would skew the
-    tokenizer toward the first subjects only).
-    """
     from datasets import load_dataset
 
     configs = list(configs or HF_TEXT_CONFIGS)
@@ -188,10 +136,6 @@ def iter_hf_text(repo: str = HF_REPO,
 
 
 def iter_corpus(files: List[str], args) -> Iterator[str]:
-    """Dispatch between local files and a Hub dataset.
-
-    Local paths always win so a smoke test can run without network access.
-    """
     if files:
         return iter_text_files(files, limit_bytes=getattr(args, "limit_bytes", None))
     repo = getattr(args, "hf_repo", None)
@@ -211,16 +155,6 @@ def iter_corpus(files: List[str], args) -> Iterator[str]:
 # Trainer
 # ──────────────────────────────────────────────────────────────────────
 def build_trainer(vocab_size: int, min_frequency: int = 2):
-    """Byte-level BPE trainer.
-
-    Byte-level (vs. tiktoken's regex pretokenizer + BPE) is chosen because it
-    is the fastest to train, has zero out-of-vocab behaviour on arbitrary
-    bytes, and is what we can train reliably on CPU. If you later want a
-    tiktoken-style split, swap the `pre_tokenizer` for the Regex one -- the
-    vocab and model code stay identical.
-
-    Returns (tokenizer, trainer).
-    """
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
     tok = Tokenizer(models.BPE(unk_token=UNK_TOKEN))
@@ -280,7 +214,6 @@ def train(args) -> Path:
 
 
 def iterator_hint(files: List[str]) -> Optional[int]:
-    """Best-effort line count so the trainer can show a progress bar."""
     total = 0
     try:
         for f in files:
@@ -296,7 +229,6 @@ def iterator_hint(files: List[str]) -> Optional[int]:
 
 
 def _write_config(out_dir: Path, vocab_size: int) -> None:
-    """Write a minimal tokenizer_config.json so AutoTokenizer can load it."""
     cfg = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "bos_token": BOS_TOKEN,
@@ -321,7 +253,6 @@ def _write_config(out_dir: Path, vocab_size: int) -> None:
 # Stats — measure the trade-off before you commit
 # ──────────────────────────────────────────────────────────────────────
 def stats(args) -> None:
-    """Measure compression on a held-out sample before committing."""
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(Path(args.out) / "tokenizer.json"))

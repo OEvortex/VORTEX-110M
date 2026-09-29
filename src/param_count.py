@@ -1,17 +1,4 @@
 #!/usr/bin/env python
-"""
-Parameter budget report.
-
-The competition rule is explicit: NO MORE THAN 50,000,000 total trainable
-parameters, INCLUDING token embeddings and the output head. This script prints
-that number from the real module tree (not an analytic formula) alongside the
-config, and exits non-zero if the budget is blown -- so it doubles as a CI gate.
-
-    python param_count.py                      # the submitted model
-    python param_count.py --arch vortex-50m-16k
-    python param_count.py --ckpt /root/vortex_50m_ckpt/step_15258
-    python param_count.py --arch vortex-50m-16k --json
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,11 +12,6 @@ PARAM_BUDGET = 50_000_000
 
 
 def count(model):
-    """Trainable-parameter total, split so the big consumers are visible.
-
-    'Trainable' is the operative word: a frozen embedding would not count, and
-    would not help you anyway at this budget.
-    """
     total = trainable = 0
     by_group = {"embedding": 0, "attention": 0, "mlp": 0, "norm": 0, "other": 0}
     tied_lm_head = 0

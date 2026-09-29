@@ -1,17 +1,3 @@
-"""
-VTX-300M benchmark evaluation.
-
-Evaluates a trained VTX-300M checkpoint on standard NLP benchmarks:
-- HellaSwag (commonsense)
-- ARC-Easy, ARC-Challenge (reasoning)
-- PIQA (physical reasoning)
-- WinoGrande (coreference)
-
-Uses lm-evaluation-harness via the simple "lm_eval" package if available,
-or implements direct perplexity-based scoring as a fallback.
-
-Run on a single GPU after pretraining is complete (or on any checkpoint).
-"""
 from __future__ import annotations
 import os
 import sys
@@ -38,19 +24,6 @@ def parse_args():
 
 
 def resolve_tokenizer_path(ckpt, explicit):
-    """Find the tokenizer that matches the checkpoint.
-
-    A vocab mismatch is not cosmetic: every logit index above the model's
-    vocab_size is unreachable, and a tokenizer with DIFFERENT ids below it
-    scores the wrong continuations. The previous default was the 8K
-    tokenizer, while the shipped model is 16K -- so every score was computed
-    against a tokenizer that could not even represent the model's ids.
-
-    Resolution order, most trustworthy first:
-      1. --tokenizer, if given
-      2. a tokenizer saved inside the checkpoint (sft.py writes one there)
-      3. the architecture's DEFAULT_TOKENIZER_ID from config.py
-    """
     from config import DEFAULT_TOKENIZER_ID
 
     if explicit:
@@ -64,11 +37,6 @@ def resolve_tokenizer_path(ckpt, explicit):
 
 @torch.no_grad()
 def score_choices(model, tokenizer, context: str, choices: list[str], device: str) -> list[float]:
-    """For each choice, compute log p(choice | context).
-
-    Returns [] when every choice overflows the context window, so callers can
-    skip the example rather than scoring a truncated one.
-    """
     scores = []
     max_pos = getattr(model.config, "max_position_embeddings", 2048)
     ctx_ids = tokenizer(context, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
@@ -100,18 +68,6 @@ def score_choices(model, tokenizer, context: str, choices: list[str], device: st
 
 
 def _pick(gold: int, scores: list) -> int | None:
-    """Argmax over usable choices.
-
-    An overflowing choice scores None. Two behaviours matter here:
-
-    - If the GOLD answer overflowed, the example is unscorable. It must be
-      dropped (return None), not counted as wrong -- truncating the prompt
-      would have made it answerable, and silently dropping correct answers
-      biases the reported accuracy.
-    - If a DISTRACTOR overflowed, drop just that distractor and pick among the
-      rest. That is the standard partial-scoring treatment and it is fair:
-      the model is not being asked to score something it cannot represent.
-    """
     usable = [(i, s) for i, s in enumerate(scores) if s is not None]
     if not usable:
         return None
