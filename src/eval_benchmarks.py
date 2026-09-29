@@ -25,12 +25,13 @@ import numpy as np
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, help="Path to VTX-300M checkpoint dir (or Hub repo id)")
-    p.add_argument("--tokenizer", default="Qwen/Qwen3-4B")
+    p.add_argument("--ckpt", required=True, help="Path to a Vortex checkpoint dir (or Hub repo id)")
+    p.add_argument("--tokenizer", default="VTXAI/vortex-tok-8k",
+                   help="MUST be the tokenizer the shards/checkpoint were trained with")
     p.add_argument("--tasks", nargs="+", default=["hellaswag", "arc_easy", "arc_challenge", "piqa", "winogrande"])
     p.add_argument("--limit", type=int, default=None, help="Limit examples per task (for smoke)")
     p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--out", default="vtx_300m_eval.json")
+    p.add_argument("--out", default="vortex_50m_eval.json")
     return p.parse_args()
 
 
@@ -170,11 +171,24 @@ def main():
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    cfg = VortexConfig()
-    model = VortexForCausalLM.from_pretrained(args.ckpt, config=cfg)
+
+    # Config MUST come from the checkpoint, not from defaults -- the vocab,
+    # layer count and head count all differ between presets, and a default
+    # config would silently build the wrong-shaped model.
+    model = VortexForCausalLM.from_pretrained(args.ckpt)
+    cfg = model.cfg
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
-    print(f"[eval] model loaded: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params on {device}", flush=True)
+
+    tok_vocab = len(tok)
+    if tok_vocab != cfg.vocab_size:
+        print(f"[eval] WARN: tokenizer has {tok_vocab:,} tokens but the model "
+              f"expects {cfg.vocab_size:,}. Scores will be wrong unless the "
+              f"tokenizer matches the one used in training.", flush=True)
+
+    print(f"[eval] model loaded: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params "
+          f"({cfg.name_or_path}: {cfg.hidden_size}d x {cfg.num_hidden_layers}L, "
+          f"vocab {cfg.vocab_size:,}) on {device}", flush=True)
 
     results = []
     for task in args.tasks:

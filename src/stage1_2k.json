@@ -1,8 +1,10 @@
 {
-  "steps": 76300,
-  "warmup": 1000,
-  "lr": 3e-4,
-  "min_lr": 3e-5,
+  "arch": "vortex-50m",
+  "tokenizer": null,
+  "steps": 60000,
+  "warmup": 600,
+  "lr": 0.0006,
+  "min_lr": 6e-05,
   "weight_decay": 0.1,
   "beta1": 0.9,
   "beta2": 0.99,
@@ -12,9 +14,9 @@
   "block": 2048,
   "seed": 42,
   "shards": "AUTO",
-  "hub_repo": "VTXAI/vtx-300m",
+  "hub_repo": "VTXAI/vortex-50m",
   "push_every": 3000,
   "log_every": 25,
-  "save_dir": "/tmp/vtx_300m_ckpts/stage1_2k",
+  "save_dir": "/tmp/vortex_50m_ckpts/stage1_2k",
   "compile": true
 }

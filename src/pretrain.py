@@ -92,7 +92,12 @@ def parse_args():
     p.add_argument("--batch", type=int, default=None)
     p.add_argument("--grad-accum", type=int, default=None)
     p.add_argument("--block", type=int, default=None)
-    p.add_argument("--rope-theta", type=float, default=None, help="RoPE base frequency (default 1M, use 50M for 128k context)")
+    p.add_argument("--arch", type=str, default=None,
+                   help="architecture preset, e.g. vortex-50m (see config.PRESETS)")
+    p.add_argument("--tokenizer", type=str, default=None,
+                   help="tokenizer dir or Hub id matching the shards on disk")
+    p.add_argument("--rope-theta", type=float, default=None,
+                   help="RoPE base (default 10k; use 1M when extending context)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--shards", nargs="+", default=None, help="Shard file paths (bin); default pulls from Hub")
     p.add_argument("--hub-repo", default=None)
@@ -111,10 +116,11 @@ def parse_args():
 # Defaults tuned for RTX 5090 Blackwell (32GB VRAM) — Lion optimizer
 DEFAULTS = dict(
     steps=76000, warmup=1000, lr=3e-4, min_lr=3e-5, weight_decay=0.1,
-    beta1=0.9, beta2=0.99, grad_clip=1.0, batch=4, grad_accum=8,
-    block=2048, seed=42, shards=None, hub_repo="VTXAI/vtx-300m",
-    trackio_space="VTXAI/vtx-300m-trackio", trackio_project="vtx-300m",
-    push_every=3000, token=None, log_every=25, save_dir="/tmp/vtx_300m_ckpt", compile=True,
+    beta1=0.9, beta2=0.99, grad_clip=1.0, batch=8, grad_accum=4,
+    block=2048, seed=42, shards=None, hub_repo="VTXAI/vortex-50m",
+    trackio_space="VTXAI/vortex-50m-trackio", trackio_project="vortex-50m",
+    push_every=3000, token=None, log_every=25, save_dir="/tmp/vortex_50m_ckpt",
+    compile=True, arch="vortex-50m", tokenizer=None, rope_theta=None,
 )
 
 
@@ -148,7 +154,7 @@ def get_default_shards():
     from huggingface_hub import snapshot_download
     print("[pretrain] downloading data shards from Hub...", flush=True)
     local_data = snapshot_download(
-        repo_id="VTXAI/vortex-110m-data",
+        repo_id=os.environ.get("VORTEX_DATA_REPO", "VTXAI/vortex-50m-data"),
         repo_type="dataset",
         allow_patterns=["data/*.bin"],
     )
@@ -269,6 +275,8 @@ def main():
     ds = MMapDataset(args.shards, block_size=args.block, seed=args.seed)
     print(f"[pretrain] dataset: {len(args.shards)} shards, {ds.total_tokens/1e6:.1f}M tokens", flush=True)
 
+    # The model config's vocab is known only after the tokenizer loads, so the
+    # shard/vocab sanity check runs later, right after the model is built.
     def collate(batch):
         x = torch.stack(batch)
         return x[:, :-1], x[:, 1:]
@@ -280,23 +288,40 @@ def main():
     it = iter(loader)
 
     # ── Model ──────────────────────────────────────────────────────────
-    from config import VortexArch, TokenizerProfile
+    from config import VortexArch, TokenizerProfile, PARAM_BUDGET
     from model import VortexForCausalLM, VortexConfig
 
-    # Profile tokenizer so vocab covers all special tokens (EOS, etc.)
-    try:
-        prof = TokenizerProfile.from_hub()
-        vocab_size = prof.vocab_size
-        print(f"[pretrain] tokenizer: {prof.tokenizer_id} vocab={vocab_size} eos={prof.eos_token_id}", flush=True)
-    except Exception as e:
-        print(f"[pretrain] WARN: tokenizer profile failed: {e}", flush=True)
-        vocab_size = 151670   # safe default (Qwen3 max id+1)
+    # Architecture preset is the single source of truth for the shape.
+    arch = VortexArch.from_name(args.arch)
+    arch.max_position_embeddings = args.block
+    if args.rope_theta is not None:
+        arch.rope_theta = args.rope_theta
+    arch.validate()
 
-    arch_kwargs = dict(max_position_embeddings=args.block, vocab_size=vocab_size)
-    if getattr(args, "rope_theta", None) is not None:
-        arch_kwargs["rope_theta"] = args.rope_theta
-    arch = VortexArch(**arch_kwargs)
-    cfg = VortexConfig(**{**vars(arch)})
+    # The tokenizer's real vocab is authoritative. It must match the shards
+    # on disk -- a mismatch here silently trains on garbage ids.
+    try:
+        prof = TokenizerProfile.from_pretrained(args.tokenizer)
+        if prof.vocab_size != arch.vocab_size:
+            print(f"[pretrain] NOTE: tokenizer vocab {prof.vocab_size:,} != preset "
+                  f"{arch.vocab_size:,}; using the tokenizer's value so the model "
+                  f"can represent every id in the shards.", flush=True)
+        arch.vocab_size = prof.vocab_size
+        print(f"[pretrain] tokenizer: {prof.tokenizer_id} vocab={prof.vocab_size:,} "
+              f"eos={prof.eos_token_id}", flush=True)
+    except Exception as e:
+        print(f"[pretrain] WARN: could not load tokenizer ({e});", flush=True)
+        print(f"[pretrain]       falling back to the preset vocab "
+              f"{arch.vocab_size:,}. Data MUST have been tokenized with it.", flush=True)
+
+    over = arch.n_params() - PARAM_BUDGET
+    if over > 0:
+        print(f"[pretrain] ERROR: {arch.name_or_path} is {arch.n_params()/1e6:.2f}M, "
+              f"{over/1e6:.2f}M OVER the {PARAM_BUDGET/1e6:.0f}M budget.", flush=True)
+        sys.exit(1)
+    print(arch.summary(), flush=True)
+
+    cfg = VortexConfig(**arch.to_dict())
     if getattr(args, "rope_theta", None) is not None:
         print(f"[pretrain] rope_theta={args.rope_theta:.0f} (context extension enabled)", flush=True)
 
@@ -313,7 +338,29 @@ def main():
 
     n = sum(p.numel() for p in model.parameters())
     n_no_embed = n - model.model.embed_tokens.weight.numel()
-    print(f"[pretrain] model: {n/1e6:.1f}M params ({n_no_embed/1e6:.1f}M non-embed)", flush=True)
+    print(f"[pretrain] model: {n/1e6:.2f}M params ({n_no_embed/1e6:.2f}M non-embed)", flush=True)
+
+    # Every id in the shards must be representable. If the data was tokenized
+    # with a DIFFERENT (larger) vocab than the model has, ids >= vocab_size
+    # reach the embedding and either crash or silently wrap -- so check the
+    # real maximum instead of trusting the config.
+    try:
+        import numpy as _np
+        max_id = 0
+        for p in args.shards[:3]:
+            arr = _np.memmap(p, dtype=_np.uint32, mode="r")
+            if len(arr):
+                max_id = max(max_id, int(arr[:min(len(arr), 5_000_000)].max()))
+        if max_id >= arch.vocab_size:
+            print(f"[pretrain] ERROR: shards contain token id {max_id} but the model's "
+                  f"vocab is only {arch.vocab_size:,}.", flush=True)
+            print(f"[pretrain]        The data was tokenized with a different "
+                  f"tokenizer. Re-tokenize with `retokenize.py` or point "
+                  f"--tokenizer at the right one.", flush=True)
+            sys.exit(1)
+        print(f"[pretrain] shard id range: 0..{max_id} (fits vocab {arch.vocab_size:,})", flush=True)
+    except FileNotFoundError:
+        pass
     print(f"[pretrain] architecture: hidden={cfg.hidden_size} layers={cfg.num_hidden_layers} "
           f"heads={cfg.num_attention_heads} kv_heads={getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads)} "
           f"intermediate={cfg.intermediate_size} context={cfg.max_position_embeddings}", flush=True)
