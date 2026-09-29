@@ -1,16 +1,16 @@
 {
-  "arch": "vortex-50m",
+  "arch": "vortex-50m-16k",
   "tokenizer": null,
-  "steps": 12000,
-  "warmup": 200,
+  "steps": 6000,
+  "warmup": 150,
   "lr": 0.0006,
   "min_lr": 6e-05,
   "weight_decay": 0.1,
   "beta1": 0.9,
   "beta2": 0.99,
   "grad_clip": 1.0,
-  "batch": 4,
-  "grad_accum": 8,
+  "batch": 2,
+  "grad_accum": 16,
   "block": 8192,
   "seed": 42,
   "shards": "AUTO",
@@ -18,5 +18,10 @@
   "push_every": 3000,
   "log_every": 25,
   "save_dir": "/tmp/vortex_50m_ckpts/stage2_8k",
-  "compile": true
+  "compile": true,
+  "fused_adamw": true,
+  "auto_batch": true,
+  "target_batch": 32,
+  "val_every": 500,
+  "val_tokens": 2000000
 }

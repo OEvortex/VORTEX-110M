@@ -127,6 +127,8 @@ def parse_args():
     p.add_argument("--auto-batch", action="store_true", default=None,
                    help="Probe the GPU for the largest batch that fits, then set "
                         "grad_accum to hit --target-batch tokens")
+    p.add_argument("--no-auto-batch", dest="auto_batch", action="store_false", default=None,
+                   help="Disable GPU probing; use --batch / --grad-accum verbatim")
     p.add_argument("--target-batch", type=int, default=None,
                    help="effective batch (in sequences) to hold constant when "
                         "--auto-batch picks the per-device batch")
@@ -207,7 +209,7 @@ DEFAULTS = dict(
     block=2048, seed=42, shards=None, hub_repo="VTXAI/vortex-50m",
     trackio_space="VTXAI/vortex-50m-trackio", trackio_project="vortex-50m",
     push_every=3000, token=None, log_every=25, save_dir="/tmp/vortex_50m_ckpt",
-    compile=True, arch="vortex-50m", tokenizer=None, rope_theta=None,
+    compile=True, arch="vortex-50m-16k", tokenizer=None, rope_theta=None,
     fused_adamw=True, auto_batch=True, target_batch=32,
     val_every=500, val_tokens=2_000_000,
 )
@@ -702,12 +704,34 @@ def main():
         print("-" * 64)
         best_st, _, best_vl = min(val_history, key=lambda r: r[2])
         last_gap = val_history[-1][1] - val_history[-1][2]
+
+        # How far into the run are we? A gap only means something once the
+        # model has actually had time to fit anything.
+        progress = args.steps and val_history[-1][0] / args.steps
+        mature = progress is not None and progress >= 0.5
+
+        # Require the gap to be BOTH meaningful in size AND persistent across
+        # consecutive checks. A single negative reading is noise: dropout-free
+        # training still has batch-to-batch variance, and early in a run the
+        # held-out split is simply easier than the training draw.
+        recent = val_history[-3:]
+        n_negative = sum(1 for _, tr, vl in recent if tr - vl < -0.05)
+
         print(f"best val    {best_vl:.4f} at step {best_st}")
         print(f"final gap   {last_gap:+.4f}  (train - val)")
-        if last_gap < -0.02:
-            print("VERDICT     OVERFITTING -- val loss is below train loss, which")
-            print("            means the held-out split leaked or the LR is too")
-            print("            high late in the schedule. Reduce steps or add data.")
+        print(f"progress    {(progress or 0)*100:.0f}% of run complete")
+
+        if not mature:
+            print("VERDICT     TOO EARLY TO TELL -- the run is under 50% complete, so")
+            print("            train and val have not diverged yet. Re-read this")
+            print("            table at the end of training.")
+        elif last_gap < -0.05 and n_negative >= 2:
+            print("VERDICT     OVERFITTING -- held-out loss is now persistently BELOW")
+            print(f"            training loss (last {n_negative} of {len(recent)} checks).")
+            print("            Either the val split leaked, or the model is memorizing.")
+            print("            Fix: fewer steps, lower LR late in the schedule, or more data.")
+        elif last_gap < -0.05:
+            print("VERDICT     probably noise -- one negative reading, not a trend yet.")
         elif last_gap > 0.15:
             print("VERDICT     generalising, but a widening gap -- monitor; if it")
             print("            keeps growing the run will eventually memorize.")

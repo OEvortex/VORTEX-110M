@@ -12,7 +12,6 @@ tied embedding table the vocab is the biggest single lever on the budget:
      32,768    512       16.8M          34%  (width is now the limit)
      16,384    512        8.4M          17%  (depth is now the limit)
       8,192    640        5.2M          11%  (12 layers, 49.99M total)
-
 Note the constraint FLIPS as the vocab shrinks. At 32K the embedding table
 dominates and hidden size is capped. At 8K the table is nearly free, so the
 same 50M budget buys a WIDER model (640d) instead of more parameters spent on
@@ -66,28 +65,29 @@ from typing import Dict, Optional
 class VortexArch:
     """Architecture hyperparameters for a decoder-only Transformer.
 
-    Defaults mirror the `vortex-50m` preset and land at **49,993,248 params**
-    (tied embeddings, English vocab=8192). `n_params()` is an exact analytic
-    count that matches the real module tree parameter-for-parameter.
+    Defaults mirror the `vortex-50m-16k` preset and land at **49,844,992 params**
+    (tied embeddings, vocab=16,384). `n_params()` is an exact analytic count
+    that matches the real module tree parameter-for-parameter.
 
     Param budget for the default preset:
-        embedding (tied, counted once)   5.24M   10.5%
-        12 x decoder block                3.71M    7.4%  (44.75M total)
+        embedding (tied, counted once)   8.39M   16.8%
+        18 x decoder block               2.30M    4.6%  (41.45M total)
         final norm                          0.00M
         ----------------------------------------------------
-        total                            49.99M  100%
+        total                            49.84M  100%
 
-    89% of the budget sits in transformer layers rather than a lookup table --
-    the direct payoff of the small English vocabulary.
+    83% of the budget sits in transformer layers rather than a lookup table --
+    the direct payoff of the 16K English vocabulary.
     """
 
     # ── Shape ────────────────────────────────────────────────────────
-    vocab_size: int = 8_192
-    hidden_size: int = 640
-    num_hidden_layers: int = 12
-    num_attention_heads: int = 10         # 10 x 64 = 640 = hidden_size
-    num_key_value_heads: int = 2          # GQA: 2 KV heads serve 10 Q heads
-    intermediate_size: int = 1_408        # ~2.20x hidden (SwiGLU sweet spot)
+    # Defaults mirror the `vortex-50m-16k` preset: 16,384 English tokens.
+    vocab_size: int = 16_384
+    hidden_size: int = 512
+    num_hidden_layers: int = 18
+    num_attention_heads: int = 8          # 8 x 64 = 512 = hidden_size
+    num_key_value_heads: int = 2          # GQA: 2 KV heads serve 8 Q heads
+    intermediate_size: int = 1_072        # ~2.09x hidden
 
     # ── Norms / positions ─────────────────────────────────────────────
     rms_norm_eps: float = 1e-6
@@ -108,7 +108,7 @@ class VortexArch:
 
     # ── Identity ─────────────────────────────────────────────────────
     model_type: str = "vortex"
-    name_or_path: str = "vortex-50m"
+    name_or_path: str = "vortex-50m-16k"
 
     # ── Derived ──────────────────────────────────────────────────────
     @property
@@ -309,7 +309,7 @@ PRESETS: Dict[str, dict] = {
 # ──────────────────────────────────────────────────────────────────────
 # Tokenizer profile
 # ──────────────────────────────────────────────────────────────────────
-DEFAULT_TOKENIZER_ID = "VTXAI/vortex-tok-8k"
+DEFAULT_TOKENIZER_ID = "VTXAI/vortex-tok-16k"
 
 
 @dataclass
@@ -321,7 +321,7 @@ class TokenizerProfile:
     and MUST match the tokenizer used to build the `.bin` shards.
     """
     tokenizer_id: str = DEFAULT_TOKENIZER_ID
-    vocab_size: int = 8_192
+    vocab_size: int = 16_384
     bos_token_id: int = 1
     eos_token_id: int = 2
     pad_token_id: int = 0
@@ -357,7 +357,7 @@ class TokenizerProfile:
 class HubConfig:
     model_repo: str = "VTXAI/vortex-50m"
     tokenizer_repo: str = DEFAULT_TOKENIZER_ID
-    data_repo: str = "VTXAI/vortex-50m-data-8k"
+    data_repo: str = "VTXAI/vortex-50m-data-16k"
     trackio_space_id: str = "VTXAI/vortex-50m-trackio"
     trackio_project: str = "vortex-50m"
 

@@ -14,7 +14,7 @@ manageable size for memmapping and can stream to the Hub independently.
 Usage
 -----
     python retokenize.py \
-        --tokenizer ./vortex-tok-8k \
+        --tokenizer ./vortex-tok-16k \
         --out ./data32k \
         /path/to/corpus/*.jsonl
 """

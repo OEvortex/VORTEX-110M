@@ -1,8 +1,8 @@
 {
-  "arch": "vortex-50m",
+  "arch": "vortex-50m-16k",
   "tokenizer": null,
-  "steps": 60000,
-  "warmup": 600,
+  "steps": 30517,
+  "warmup": 305,
   "lr": 0.0006,
   "min_lr": 6e-05,
   "weight_decay": 0.1,
@@ -18,5 +18,10 @@
   "push_every": 3000,
   "log_every": 25,
   "save_dir": "/tmp/vortex_50m_ckpts/stage1_2k",
-  "compile": true
+  "compile": true,
+  "fused_adamw": true,
+  "auto_batch": true,
+  "target_batch": 32,
+  "val_every": 500,
+  "val_tokens": 2000000
 }

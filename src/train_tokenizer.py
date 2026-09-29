@@ -392,10 +392,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("files", nargs="*", help="corpus .jsonl/.txt/.parquet paths or dirs")
-    p.add_argument("--out", default="./vortex-tok-8k", help="output dir")
-    p.add_argument("--vocab-size", type=int, default=8_192,
-                   help="8192 for English-only; 16384 if you want margin; "
-                        "32768 only for multilingual/code")
+    p.add_argument("--out", default="./vortex-tok-16k", help="output dir")
+    p.add_argument("--vocab-size", type=int, default=16_384,
+                   help="16384 for English-only (default); 8192 to spend the budget "
+                        "on width instead; 32768 only for multilingual/code")
     p.add_argument("--min-frequency", type=int, default=2)
     p.add_argument("--limit-bytes", type=int, default=None,
                    help="optional cap on corpus bytes (local files only, smoke tests)")
