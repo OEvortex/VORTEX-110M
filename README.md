@@ -179,6 +179,17 @@ larger model, which the parameter budget forbids.
 Order matters: **tokenizer → retokenize → train**. The `.bin` shards become
 invalid the moment the vocabulary changes.
 
+To publish a trained checkpoint for `transformers` users, add:
+
+```bash
+# 5. Write an auto_map Hub repo (weights are reused as-is)
+python src/export_hf.py --ckpt ./vortex_50m_ckpt/step_15258 \
+    --tokenizer ./vortex-tok-16k --out ./vortex-50m-16k-hf \
+    --push-to VTXAI/vortex-50m-16k
+```
+
+See [`src/README_hf.md`](src/README_hf.md).
+
 ```bash
 # 1. Train the tokenizer (CPU, 34 min)
 python src/train_tokenizer.py --out ./vortex-tok-16k --vocab-size 16384
@@ -240,12 +251,29 @@ python src/test_sft.py             # SFT dataset, collate, embedding resize
 python src/test_eval_benchmarks.py # benchmark scoring edge cases
 ```
 
+For the `transformers` integration — KV cache, `generate()`, `AutoModelForCausalLM`,
+`auto_map` export:
+
+```bash
+python src/test_hf_modeling.py     # 57 checks: parity with model.py, cache, generate
+python src/test_export_hf.py       # 28 checks: export, then load in a clean process
+```
+
+`test_hf_modeling.py` asserts **bit-exact** agreement with `model.py`: identical
+`state_dict` keys, identical logits, identical loss. That is what guarantees a
+checkpoint trained before the `transformers` modules existed loads into a model
+built after them. See [`src/README_hf.md`](src/README_hf.md) for usage.
+
 ## Files
 
 | file | role |
 |---|---|
 | `src/config.py` | `VortexArch`, presets, exact parameter accounting, budget guard |
 | `src/model.py` | the architecture — attention, MLP, blocks, RoPE, QK-Norm |
+| `src/configuration_vortex.py` | `VortexConfig` — `transformers` config, shape validation |
+| `src/modeling_vortex.py` | `transformers` model — KV cache, `generate()`, `Trainer` |
+| `src/export_hf.py` | writes an `auto_map` Hub repo from a training checkpoint |
+| `src/README_hf.md` | **loading and running the model with `transformers`** |
 | `src/train_tokenizer.py` | trains the 16K BPE, reports compression stats |
 | `src/retokenize.py` | rebuilds `uint32` `.bin` shards with the new vocab |
 | `src/dataset.py` | memory-mapped streaming dataset |
@@ -262,8 +290,10 @@ python src/test_eval_benchmarks.py # benchmark scoring edge cases
 
 - **PyTorch** — `torch.nn`, SDPA (`enable_gqa`), gradient checkpointing, fused AdamW
 - **HuggingFace transformers** — `PreTrainedModel` / `PretrainedConfig` wrappers
-  only, so checkpoints serialize via `save_pretrained`; the architecture itself
-  is hand-defined
+  for checkpoint serialization, plus full `configuration_vortex.py` /
+  `modeling_vortex.py` modules that register with `AutoConfig` and
+  `AutoModelForCausalLM` so the model loads and generates through the standard
+  API; the architecture itself is hand-defined
 - **tokenizers** — BPE training
 - **datasets** — streaming `HuggingFaceTB/smollm-corpus`, WikiText-103
 - **lm-evaluation-harness** (EleutherAI) — the four scored multiple-choice tasks
