@@ -19,12 +19,20 @@ import sys
 import math
 import time
 import json
+import random
 import argparse
+import re
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+# Matches a checkpoint directory name exactly: "step_3000" -> 3000.
+# Anchored so a stray "step_3000_old" or "step_abc" is ignored rather than
+# crashing the scan.
+_STEP_DIR_RE = re.compile(r"step_(\d+)")
 
 
 def build_optimizer(model, args):
@@ -136,6 +144,14 @@ def parse_args():
                    help="Run validation every N steps (0 disables)")
     p.add_argument("--val-tokens", type=int, default=None,
                    help="Tokens to use for each validation pass")
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="DataLoader worker processes (0 = load in the main process)")
+    p.add_argument("--resume-from-hub", type=str, default=None, metavar="REPO",
+                   help="Hub model repo to pull a resumable checkpoint from when "
+                        "save_dir has none (e.g. VTXAI/vortex-50m-16k). "
+                        "Defaults to --hub-repo when that is set.")
+    p.add_argument("--hub-only", action="store_true",
+                   help="Ignore local checkpoints entirely and resume from the Hub")
     return p.parse_args()
 
 
@@ -211,7 +227,8 @@ DEFAULTS = dict(
     push_every=3000, token=None, log_every=25, save_dir="/tmp/vortex_50m_ckpt",
     compile=True, arch="vortex-50m-16k", tokenizer=None, rope_theta=None,
     fused_adamw=True, auto_batch=True, target_batch=32,
-    val_every=500, val_tokens=2_000_000,
+    val_every=500, val_tokens=2_000_000, num_workers=8,
+    resume_from_hub=None, hub_only=False,
 )
 
 
@@ -264,12 +281,9 @@ def find_latest_checkpoint(save_dir):
         return None, 0
     candidates = []
     for name in os.listdir(save_dir):
-        if name.startswith("step_") and os.path.isdir(os.path.join(save_dir, name)):
-            try:
-                step_num = int(name.split("_", 1)[1])
-                candidates.append((step_num, os.path.join(save_dir, name)))
-            except ValueError:
-                continue
+        m = _STEP_DIR_RE.fullmatch(name)
+        if m and os.path.isdir(os.path.join(save_dir, name)):
+            candidates.append((int(m.group(1)), os.path.join(save_dir, name)))
     if not candidates:
         return None, 0
     candidates.sort(key=lambda x: x[0])
@@ -287,20 +301,265 @@ def find_latest_checkpoint(save_dir):
     return best_path, best_step
 
 
-def save_checkpoint(model, optim, step, args, losses):
-    """Save model + optimizer + training state to a checkpoint directory."""
+def read_state_step(path):
+    """Read the `step` field out of a training_state.pt.
+
+    A 50M-param AdamW checkpoint carries ~400MB of fp32 moments and
+    `torch.load` has no lazy-field mode, so the payload is materialized
+    whether or not the moments are wanted. All this saves is the optimizer
+    reconstruction -- it keeps the call site honest about needing one integer.
+    Returns None if the file is unreadable.
+    """
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        return int(state["step"])
+    except Exception as e:
+        print(f"[pretrain] WARN: could not read step from {path} ({e})", flush=True)
+        return None
+
+
+def _weights_present(d):
+    return any(f.endswith(".safetensors") or f.endswith(".bin")
+               for f in os.listdir(d))
+
+
+def fetch_hub_checkpoint(repo_id, token=None, save_dir=None):
+    """Download a resumable checkpoint from a Hub model repo.
+
+    Checkpoints are pushed to the Hub as a FLAT snapshot -- `model.safetensors`,
+    `config.json`, `training_state.pt` and the tokenizer files all sit at the
+    repo root, because `api.upload_folder(folder_path=ckpt, ...)` preserves no
+    directory structure. There is therefore no `step_3000/` prefix to read a
+    step number from; the step lives INSIDE `training_state.pt`, so it is
+    fetched first and used to name the destination directory.
+
+    Returns (path, step) for a checkpoint safe to resume from, or (None, 0)
+    if the repo is unreachable or unusable as a resume point.
+    """
+    import shutil
+
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    try:
+        files = list_repo_files(repo_id, repo_type="model", token=token)
+    except Exception as e:
+        print(f"[pretrain] WARN: cannot reach Hub repo {repo_id} ({e})", flush=True)
+        return None, 0
+
+    if "training_state.pt" not in files:
+        print(f"[pretrain] WARN: {repo_id} has no training_state.pt, so it "
+              f"cannot be used to RESUME -- it only holds weights. Pass "
+              f"--no-resume to fine-tune from its weights instead.", flush=True)
+        return None, 0
+    if not any(f.endswith(".safetensors") for f in files):
+        print(f"[pretrain] WARN: {repo_id} has no model.safetensors", flush=True)
+        return None, 0
+
+    # 1. training_state.pt first: its step number decides where everything
+    #    lands. Downloaded to a scratch dir, then moved into place once the
+    #    step is known.
+    if not save_dir:
+        return None, 0
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1a. Never re-download what is already staged. A resumed run re-enters
+    #     here on every restart, and the step number needed to identify the
+    #     staged dir lives INSIDE the 400MB state file -- so without this
+    #     check each restart pays a full re-download to learn it already has
+    #     the answer. The step dir name is the only place the step is recorded.
+    staged_path, staged_step = find_latest_checkpoint(save_dir)
+    if staged_path is not None:
+        print(f"[pretrain] Hub checkpoint step {staged_step} already staged at "
+              f"{staged_path}; not re-downloading", flush=True)
+        return staged_path, staged_step
+
+    staging = os.path.join(save_dir, ".hub_staging")
+    os.makedirs(staging, exist_ok=True)
+
+    print(f"[pretrain] fetching training_state.pt from {repo_id} "
+          f"(~400MB)...", flush=True)
+    try:
+        state_path = hf_hub_download(repo_id, "training_state.pt",
+                                     repo_type="model", token=token,
+                                     local_dir=staging)
+    except Exception as e:
+        print(f"[pretrain] WARN: download of training_state.pt failed ({e})", flush=True)
+        return None, 0
+
+    step = read_state_step(state_path)
+    if step is None:
+        print("[pretrain] WARN: training_state.pt is unreadable; cannot "
+              "determine the resume step", flush=True)
+        return None, 0
+
+    # 2. Land it as save_dir/step_N/, exactly the layout save_checkpoint()
+    #    writes, so every later local resume finds it with no special-casing.
+    dest = os.path.join(save_dir, f"step_{step}")
+    os.makedirs(dest, exist_ok=True)
+    print(f"[pretrain] resuming from Hub {repo_id} at step {step} -> {dest}",
+          flush=True)
+
+    # 3. Weights + config + tokenizer files alongside it. `local_dir` keeps the
+    #    repo's own directory structure, and the repo root is flat, so these
+    #    land directly in `staging` and are then moved into `dest`.
+    wanted = [f for f in files
+              if f.endswith((".safetensors", ".json", ".model", ".txt"))]
+    for fname in wanted:
+        try:
+            hf_hub_download(repo_id, fname, repo_type="model", token=token,
+                            local_dir=staging)
+            print(f"[pretrain]   + {fname}", flush=True)
+        except Exception as e:
+            print(f"[pretrain] WARN: could not fetch {fname} ({e})", flush=True)
+
+    for entry in os.listdir(staging):
+        src = os.path.join(staging, entry)
+        if os.path.isfile(src):
+            shutil.move(src, os.path.join(dest, entry))
+    try:
+        os.rmdir(staging)
+    except OSError:
+        pass
+
+    if not _weights_present(dest):
+        print(f"[pretrain] WARN: fetched checkpoint at {dest} has no model "
+              f"weights -- cannot resume", flush=True)
+        return None, 0
+
+    print(f"[pretrain] Hub checkpoint ready: {dest} (step {step})", flush=True)
+    return dest, step
+
+
+def resolve_resume_point(args):
+    """Decide which checkpoint to resume from, local first, then the Hub.
+
+    Local wins by default: a local step_N is either this machine's own newer
+    work or the same Hub snapshot already staged, and re-downloading 600MB to
+    end up at an older step would be a regression, not a resume. The Hub is
+    consulted exactly when the local directory cannot supply a usable
+    checkpoint -- a fresh box, a wiped volume, or a preemption that lost the
+    scratch disk.
+
+    `--no-resume` short-circuits everything here, including the Hub: it means
+    "do not continue anyone's run", not "continue from somewhere else".
+    """
+    if getattr(args, "no_resume", False):
+        path, _ = find_latest_checkpoint(args.save_dir)
+        if path is not None:
+            print(f"[pretrain] --no-resume set, ignoring checkpoint at {path}", flush=True)
+        else:
+            print("[pretrain] --no-resume set, not fetching from the Hub", flush=True)
+        return None, 0, None
+
+    if getattr(args, "hub_only", False):
+        print("[pretrain] --hub-only: ignoring local checkpoints", flush=True)
+        return None, 0, None
+
+    path, step = find_latest_checkpoint(args.save_dir)
+    if path is not None:
+        return path, step, None
+
+    repo = getattr(args, "resume_from_hub", None) or args.hub_repo
+    if not repo:
+        return None, 0, None
+
+    # Make the staging directory exist before the (slow) download, so a full
+    # disk fails in seconds rather than after 600MB of transfer.
+    os.makedirs(args.save_dir, exist_ok=True)
+    path, step = fetch_hub_checkpoint(repo, token=args.token, save_dir=args.save_dir)
+    if path is None:
+        return None, 0, None
+    return path, step, repo
+
+
+def _detach_rng_state(obj):
+    """Coerce anything RNG-shaped into a contiguous CPU uint8 ByteTensor.
+
+    torch.save/load round-trips the state correctly, but the LOAD side is
+    the trap: `torch.load(..., map_location=device)` on a GPU box
+    deserializes the saved CPU ByteTensor as a CUDA tensor, and
+    `torch.random.set_rng_state` accepts only a CPU ByteTensor. Callers get
+    `TypeError: RNG state must be a torch.ByteTensor` from deep inside
+    torch/random.py, which reads like a corrupted checkpoint rather than a
+    device-placement mismatch.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    try:
+        return torch.as_tensor(np.asarray(obj, dtype=np.uint8),
+                               dtype=torch.uint8).contiguous()
+    except Exception:
+        return None
+
+
+def restore_rng(rng):
+    """Best-effort restore of every RNG stream a checkpoint carries.
+
+    Each stream is independent and non-fatal: failing to restore one costs
+    exact reproducibility of the next few steps, not the run itself. That
+    matters because the torch stream is a ByteTensor whose device depends on
+    the loader, and checkpoints written by older builds may not carry the
+    python/numpy streams at all.
+    """
+    if not rng:
+        return
+
+    cpu_state = _detach_rng_state(rng.get("torch"))
+    if cpu_state is not None:
+        try:
+            torch.random.set_rng_state(cpu_state)
+        except Exception as e:
+            print(f"[pretrain] WARN: torch RNG state not restored ({e}); "
+                  f"resume will not be bit-identical", flush=True)
+
+    cuda_state = _detach_rng_state(rng.get("cuda"))
+    if cuda_state is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state(cuda_state)
+        except Exception as e:
+            print(f"[pretrain] WARN: CUDA RNG state not restored ({e})", flush=True)
+
+    py_state = rng.get("python")
+    if py_state is not None:
+        try:
+            random.setstate(py_state)
+        except Exception:
+            pass
+
+    np_state = rng.get("numpy")
+    if np_state is not None and len(np_state) >= 3:
+        try:
+            np.random.set_state(tuple(np_state))
+        except Exception:
+            pass
+
+
+def save_checkpoint(model, optim, step, args, losses, val_history=None,
+                    best_val=None):
+    """Save model + optimizer + RNG + history to a checkpoint directory."""
     ckpt = os.path.join(args.save_dir, f"step_{step}")
     os.makedirs(ckpt, exist_ok=True)
     save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
     save_model.save_pretrained(ckpt)
-    # Save optimizer + step + RNG states for faithful resume
+    # Save optimizer + step + RNG states for faithful resume. RNG states are
+    # explicitly pulled to CPU here so the file is portable across machines
+    # and independent of the map_location used at load time.
+    rng = {
+        "torch": torch.random.get_rng_state().cpu(),
+        "cuda": (torch.cuda.get_rng_state().cpu()
+                 if torch.cuda.is_available() else None),
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+    }
     torch.save({
         "step": step,
         "optim": optim.state_dict(),
-        "rng": {
-            "torch": torch.random.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-        },
+        "rng": rng,
+        "losses": list(losses),
+        "val_history": list(val_history or []),
+        "best_val": best_val,
         "config": vars(args),
     }, os.path.join(ckpt, "training_state.pt"))
     print(f"[pretrain] saved checkpoint: {ckpt}", flush=True)
@@ -308,24 +567,29 @@ def save_checkpoint(model, optim, step, args, losses):
 
 
 def load_checkpoint(ckpt_path, model, optim, device):
-    """Load optimizer state and step number from a checkpoint.
+    """Load optimizer state, RNG streams, history, and step from a checkpoint.
 
     Model weights are assumed already loaded by from_pretrained.
-    Returns the step to resume from (next step after the saved one).
+    Returns a dict with the step to resume from (the step AFTER the saved one)
+    plus the restored loss/validation history, so the final train-vs-val
+    report and the overfit streak counter span the whole run instead of
+    starting over blank at the resume point.
     """
+    empty = {"step": 0, "losses": [], "val_history": [], "best_val": None}
     state_file = os.path.join(ckpt_path, "training_state.pt")
     if not os.path.exists(state_file):
-        return 0
-    state = torch.load(state_file, map_location=device, weights_only=False)
+        return empty
+    state = torch.load(state_file, map_location="cpu", weights_only=False)
     optim.load_state_dict(state["optim"])
-    rng = state.get("rng", {})
-    if rng.get("torch") is not None:
-        torch.random.set_rng_state(rng["torch"])
-    if rng.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state(rng["cuda"])
-    resumed_step = state["step"]
+    restore_rng(state.get("rng") or {})
+    resumed_step = int(state["step"])
     print(f"[pretrain] loaded training state from step {resumed_step}", flush=True)
-    return resumed_step + 1  # resume from next step
+    return {
+        "step": resumed_step + 1,  # resume from the next step
+        "losses": list(state.get("losses") or []),
+        "val_history": [tuple(r) for r in (state.get("val_history") or [])],
+        "best_val": state.get("best_val"),
+    }
 
 
 def main():
@@ -351,13 +615,12 @@ def main():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[pretrain] VRAM: {vram_gb:.1f}GB", flush=True)
 
-    # ── Checkpoint auto-discovery ──────────────────────────────────────
-    ckpt_path, ckpt_step = find_latest_checkpoint(args.save_dir)
-    resume = ckpt_path is not None and not getattr(args, "no_resume", False)
+    # ── Checkpoint auto-discovery (local, then Hub) ─────────────────────
+    ckpt_path, ckpt_step, hub_src = resolve_resume_point(args)
+    resume = ckpt_path is not None
     if resume:
-        print(f"[pretrain] found checkpoint: {ckpt_path} (step {ckpt_step})", flush=True)
-    elif ckpt_path:
-        print(f"[pretrain] --no-resume set, ignoring checkpoint at {ckpt_path}", flush=True)
+        src = f" (from Hub {hub_src})" if hub_src else ""
+        print(f"[pretrain] found checkpoint: {ckpt_path} (step {ckpt_step}){src}", flush=True)
 
     # ── Data ───────────────────────────────────────────────────────────
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -372,11 +635,33 @@ def main():
         x = torch.stack(batch)
         return x[:, :-1], x[:, 1:]
 
-    loader = DataLoader(
-        ds, batch_size=args.batch, num_workers=8, pin_memory=True,
-        collate_fn=collate, persistent_workers=True, prefetch_factor=4,
-    )
-    it = iter(loader)
+    def make_loader(epoch: int):
+        """Build the training loader for a given data-stream epoch.
+
+        `worker_init_fn` is load-bearing, not boilerplate. MMapDataset seeds a
+        single RNG in __init__, and forked workers inherit that state verbatim
+        -- so all 8 workers draw the IDENTICAL sample sequence. The interleaved
+        batches are then the same block 8 times over: an 8x cut in the unique
+        data actually seen, completely silent. `set_epoch` already folds the
+        worker id into its seed, so re-seeding per worker is all it takes.
+
+        The loader is built lazily (after the checkpoint load) so the epoch can
+        be seeded from the resumed step. Workers fork and freeze their RNG at
+        first iteration, so a loader seeded before the resume would replay the
+        blocks the interrupted run already trained on.
+        """
+        ds.set_epoch(epoch)
+
+        def _init_worker(_):
+            ds.set_epoch(epoch)
+
+        nw = max(0, args.num_workers)
+        return DataLoader(
+            ds, batch_size=args.batch, num_workers=nw, pin_memory=True,
+            collate_fn=collate, persistent_workers=nw > 0,
+            worker_init_fn=_init_worker if nw > 0 else None,
+            prefetch_factor=4 if nw > 0 else None,
+        )
 
     # ── Model ──────────────────────────────────────────────────────────
     from config import VortexArch, TokenizerProfile, PARAM_BUDGET
@@ -391,8 +676,15 @@ def main():
 
     # The tokenizer's real vocab is authoritative. It must match the shards
     # on disk -- a mismatch here silently trains on garbage ids.
+    # An explicit --tokenizer wins; otherwise fall back to DEFAULT_TOKENIZER_ID,
+    # so a fresh box resumes without needing a hand-placed tokenizer directory.
+    tok_source = args.tokenizer
+    if tok_source is None and hub_src:
+        # The pushed checkpoint ships its own tokenizer files, so resuming
+        # outside the original box reproduces the original tokenization.
+        tok_source = hub_src
     try:
-        prof = TokenizerProfile.from_pretrained(args.tokenizer)
+        prof = TokenizerProfile.from_pretrained(tok_source)
         if prof.vocab_size != arch.vocab_size:
             print(f"[pretrain] NOTE: tokenizer vocab {prof.vocab_size:,} != preset "
                   f"{arch.vocab_size:,}; using the tokenizer's value so the model "
@@ -523,9 +815,30 @@ def main():
 
     # Load optimizer/RNG state if resuming
     start_step = 0
+    losses = []
+    val_history = []          # (step, train_loss, val_loss)
+    best_val = float("inf")
+    overfit_strikes = 0
     if resume:
-        start_step = load_checkpoint(ckpt_path, model, optim, device)
+        ck = load_checkpoint(ckpt_path, model, optim, device)
+        start_step = ck["step"]
+        losses = ck["losses"]
+        val_history = ck["val_history"]
+        # A fresh run has no `best_val` to beat, so seed it from the checkpoint
+        # rather than re-triggering the overfit warning on the first val step
+        # that merely ties the pre-crash best.
+        best_val = ck["best_val"] if ck["best_val"] is not None else float("inf")
         print(f"[pretrain] resuming from step {start_step}", flush=True)
+
+    # Data stream is seeded from the resumed step so the worker RNGs do not
+    # replay blocks the interrupted run already consumed. Built after the
+    # checkpoint load for that reason -- workers freeze their seed at fork.
+    data_epoch = start_step // max(1, args.batch * args.grad_accum)
+    loader = make_loader(data_epoch)
+    it = iter(loader)
+    if resume and data_epoch:
+        print(f"[pretrain] data stream reseeded to epoch {data_epoch} "
+              f"(past {start_step:,} steps already consumed)", flush=True)
 
     # Enable gradient checkpointing to save VRAM (~40% less activation memory)
     model.gradient_checkpointing_enable()
@@ -541,8 +854,6 @@ def main():
         import numpy as np
 
         n_val_blocks = max(args.batch, min(64, args.val_tokens // args.block))
-        # Draw from the END of the stream; training samples randomly across all
-        # shards, so the tail is the least likely to have been seen.
         val_rng = np.random.default_rng(args.seed + 999)
         val_blocks = []
         for _ in range(n_val_blocks):
@@ -582,12 +893,8 @@ def main():
         print(f"[pretrain] remaining tokens: {(args.steps - start_step) * tok_per_step / 1e9:.2f}B", flush=True)
 
     model.train()
-    losses = []
-    val_history = []          # (step, train_loss, val_loss)
-    best_val = float("inf")
-    overfit_strikes = 0
-    t0 = time.time()
     steps_this_run = 0
+    t0 = time.time()
     for step in range(start_step, args.steps):
         lr = cosine_lr(step, args.warmup, args.steps, args.lr, args.min_lr)
         for pg in optim.param_groups:
@@ -676,7 +983,8 @@ def main():
             model.train()
 
         if (step + 1) % args.push_every == 0 or (step + 1) == args.steps:
-            ckpt = save_checkpoint(model, optim, step + 1, args, losses)
+            ckpt = save_checkpoint(model, optim, step + 1, args, losses,
+                                   val_history, best_val)
             if HAS_TRACKIO and os.environ.get("TRACKIO_SPACE_ID"):
                 trackio.log({"checkpoint_step": step + 1})
             if args.hub_repo:
