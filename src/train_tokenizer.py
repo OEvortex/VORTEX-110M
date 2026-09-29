@@ -129,6 +129,85 @@ def _iter_structured(f: Path) -> Iterator[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Hugging Face Hub corpus streaming
+# ──────────────────────────────────────────────────────────────────────
+# Verified structure of HuggingFaceTB/smollm-corpus (3 configs):
+#
+#   cosmopedia-v2       104 parquet, 122 GB  cols: prompt,text,token_length,audience,...
+#   fineweb-edu-dedup   234 parquet, 550 GB  cols: text,id,metadata
+#   python-edu            2 parquet           cols: blob_id,repo_name,path,length_bytes,... (NO text)
+#
+# `python-edu` has no text column, so it cannot be streamed as raw text without
+# first reconstructing file contents from blob ids. It is excluded by default.
+#
+# The text column is `text` in every usable config.
+HF_REPO = "HuggingFaceTB/smollm-corpus"
+HF_TEXT_CONFIGS = ("cosmopedia-v2", "fineweb-edu-dedup")
+# Configs whose schema has no `text` column -- skip rather than silently yield nothing.
+HF_SKIP_CONFIGS = ("python-edu",)
+
+
+def iter_hf_text(repo: str = HF_REPO,
+                 configs: Optional[List[str]] = None,
+                 max_docs: Optional[int] = None,
+                 text_key: str = "text",
+                 seed: int = 42) -> Iterator[str]:
+    """Stream raw text documents from a Hub dataset without downloading it.
+
+    Uses `streaming=True`, so memory stays flat regardless of dataset size --
+    essential for a 122-550 GB corpus. Shuffles the file order with a fixed
+    seed so `--max-docs` samples the whole corpus rather than always reading
+    shard 0 (cosmopedia is ordered by topic, so unshuffled would skew the
+    tokenizer toward the first subjects only).
+    """
+    from datasets import load_dataset
+
+    configs = list(configs or HF_TEXT_CONFIGS)
+    if not configs:
+        raise ValueError("No configs selected")
+
+    for cfg in configs:
+        if cfg in HF_SKIP_CONFIGS:
+            print(f"[tok] skipping {cfg!r}: schema has no {text_key!r} column",
+                  flush=True)
+            continue
+        print(f"[tok] streaming {repo} config={cfg!r}", flush=True)
+        ds = load_dataset(repo, name=cfg, split="train", streaming=True)
+        ds = ds.shuffle(seed=seed, buffer_size=10_000)
+        n = 0
+        for row in ds:
+            text = row.get(text_key)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            yield text
+            n += 1
+            if max_docs and n >= max_docs:
+                print(f"[tok] {cfg}: reached --max-docs {max_docs:,}", flush=True)
+                break
+        print(f"[tok] {cfg}: yielded {n:,} docs", flush=True)
+
+
+def iter_corpus(files: List[str], args) -> Iterator[str]:
+    """Dispatch between local files and a Hub dataset.
+
+    Local paths always win so a smoke test can run without network access.
+    """
+    if files:
+        return iter_text_files(files, limit_bytes=getattr(args, "limit_bytes", None))
+    repo = getattr(args, "hf_repo", None)
+    if repo:
+        return iter_hf_text(
+            repo=repo,
+            configs=getattr(args, "hf_configs", None),
+            max_docs=getattr(args, "max_docs", None) or None,
+            seed=getattr(args, "seed", 42),
+        )
+    raise SystemExit(
+        "[tok] ERROR: pass corpus paths, or --hf-repo to stream from the Hub."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Trainer
 # ──────────────────────────────────────────────────────────────────────
 def build_trainer(vocab_size: int, min_frequency: int = 2):
@@ -166,22 +245,32 @@ def train(args) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     files = list(args.files)
-    if not files:
-        print("[tok] ERROR: pass one or more corpus paths", file=sys.stderr)
+    if not files and not args.hf_repo:
+        print("[tok] ERROR: pass corpus paths, or --hf-repo to stream from the Hub",
+              file=sys.stderr)
         sys.exit(1)
 
     print(f"[tok] training BPE vocab={args.vocab_size} min_freq={args.min_frequency}")
-    print(f"[tok] corpus: {len(files)} path(s)")
+    if files:
+        print(f"[tok] corpus: {len(files)} local path(s)")
+    else:
+        cfgs = args.hf_configs or list(HF_TEXT_CONFIGS)
+        print(f"[tok] corpus: {args.hf_repo} configs={cfgs} "
+              f"max_docs={args.max_docs or 'all'}")
 
     tok, trainer = build_trainer(args.vocab_size, args.min_frequency)
-    iterator = iter_text_files(files, limit_bytes=args.limit_bytes)
-    tok.train_from_iterator(iterator, trainer=trainer, length=iterator_hint(files))
+    iterator = iter_corpus(files, args)
+    # Only local files have a cheap line count; a streamed Hub dataset has no
+    # meaningful total, so pass None and let the trainer report as it goes.
+    length = iterator_hint(files) if files else None
+    tok.train_from_iterator(iterator, trainer=trainer, length=length)
 
     size = tok.get_vocab_size()
     print(f"[tok] learned {size} tokens (target {args.vocab_size})")
     if size < args.vocab_size * 0.9:
         print("[tok] WARN: corpus is too small to fill the vocab; "
-              "add more data or lower --vocab-size", file=sys.stderr)
+              "add more data, raise --max-docs, or lower --vocab-size",
+              file=sys.stderr)
 
     # Save as a plain HF fast tokenizer.
     tok.save(str(out_dir / "tokenizer.json"))
@@ -232,24 +321,28 @@ def _write_config(out_dir: Path, vocab_size: int) -> None:
 # Stats — measure the trade-off before you commit
 # ──────────────────────────────────────────────────────────────────────
 def stats(args) -> None:
-    """Compare this tokenizer against the old one on a held-out sample."""
+    """Measure compression on a held-out sample before committing."""
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(Path(args.out) / "tokenizer.json"))
-    sample = _gather_sample(args.stats_files or args.files, args.stats_docs)
+    files = list(args.stats_files or args.files)
+    sample = _gather_sample(files, args.stats_docs, args)
 
     total_chars = sum(len(s) for s in sample)
     ids = tok.encode_batch(sample)
     total_tokens = sum(len(i.ids) for i in ids)
     chars_per_token = total_chars / max(1, total_tokens)
+    # Rough estimate of how many documents the 2B budget will need.
+    est_tokens_needed = 2_000_000_000
+    docs_for_2b = (est_tokens_needed / max(1, total_tokens)) * len(sample) if sample else 0
 
-    print("=" * 60)
+    print("=" * 62)
     print(f"vocab size        {tok.get_vocab_size():,}")
     print(f"documents         {len(sample):,}")
     print(f"characters        {total_chars:,}")
     print(f"tokens            {total_tokens:,}")
     print(f"chars / token     {chars_per_token:.2f}")
-    print("=" * 60)
+    print("=" * 62)
 
     # Round-trip check -- byte-level must be lossless.
     bad = 0
@@ -257,15 +350,37 @@ def stats(args) -> None:
         if tok.decode(enc.ids) != s:
             bad += 1
     print(f"round-trip exact  {'YES' if bad == 0 else f'NO ({bad}/200 differ)'}")
+
+    cpt = chars_per_token
+    if cpt < 3.0:
+        verdict = "LOW - corpus vocabulary is unusual; consider --vocab-size 16384"
+    elif cpt < 3.4:
+        verdict = "acceptable for an 8K English vocab"
+    elif cpt <= 4.2:
+        verdict = "good"
+    else:
+        verdict = "very high - vocab may be larger than it needs to be"
+    print(f"verdict           {verdict}")
     print()
-    print("Compare `chars / token` against the old tokenizer on the same text.")
-    print("Lower means more tokens per character = more training compute for the")
-    print("same corpus. ~3.5-4.0 is healthy for byte-level BPE on code+English.")
+    print("chars/token is the number that decides whether 8K is right for your")
+    print("corpus: lower = more tokens for the same text = more compute. A 32K")
+    print("byte-level BPE sits around 4.0-4.5 on English prose, 8K-16K around")
+    print("3.2-3.8. Below ~3.0 and the vocab is leaving efficiency on the table.")
 
 
-def _gather_sample(files: List[str], n_docs: int) -> List[str]:
+def _gather_sample(files: List[str], n_docs: int, args=None) -> List[str]:
     out: List[str] = []
-    for s in iter_text_files(files):
+    src: Iterator[str]
+    if files:
+        src = iter_text_files(files)
+    elif args is not None and getattr(args, "hf_repo", None):
+        src = iter_hf_text(repo=args.hf_repo,
+                           configs=getattr(args, "hf_configs", None) or
+                           list(HF_TEXT_CONFIGS),
+                           max_docs=n_docs, seed=getattr(args, "seed", 42))
+    else:
+        raise SystemExit("[tok] ERROR: no corpus for --stats (pass paths or --hf-repo)")
+    for s in src:
         out.append(s)
         if len(out) >= n_docs:
             break
@@ -283,7 +398,21 @@ def parse_args(argv=None):
                         "32768 only for multilingual/code")
     p.add_argument("--min-frequency", type=int, default=2)
     p.add_argument("--limit-bytes", type=int, default=None,
-                   help="optional cap on corpus bytes (smoke tests)")
+                   help="optional cap on corpus bytes (local files only, smoke tests)")
+
+    # -- Hugging Face Hub corpus ------------------------------------------
+    p.add_argument("--hf-repo", default=None,
+                   help=f"stream a Hub dataset instead of local files "
+                        f"(e.g. {HF_REPO})")
+    p.add_argument("--hf-configs", nargs="*", default=None,
+                   help=f"configs to stream; default {list(HF_TEXT_CONFIGS)}. "
+                        f"NOTE: python-edu has no text column and is skipped.")
+    p.add_argument("--max-docs", type=int, default=0,
+                   help="cap on documents streamed from the Hub (0 = all). "
+                        "Use this to bound download time.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="shuffle seed for Hub streaming (fixed = reproducible)")
+
     p.add_argument("--stats", action="store_true", help="report stats instead of training")
     p.add_argument("--stats-files", nargs="*", default=None)
     p.add_argument("--stats-docs", type=int, default=2000)

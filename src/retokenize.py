@@ -30,7 +30,7 @@ from typing import Iterator, List, Optional
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_tokenizer import iter_text_files  # noqa: E402
+from train_tokenizer import iter_text_files, iter_hf_text  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -110,30 +110,53 @@ def retokenize(args) -> None:
 
     print(f"[retok] tokenizer: {tok_file}  vocab={tok.get_vocab_size():,}  eos={eos_id}")
 
+    # Corpus source: local files, or stream straight from the Hub.
+    if args.files:
+        print(f"[retok] corpus: {len(args.files)} local path(s)")
+        source = iter_text_files(args.files)
+    else:
+        cfgs = args.hf_configs or None
+        print(f"[retok] corpus: streaming {args.hf_repo} configs={cfgs or 'default'}")
+        # max_docs is deliberately 0 here -- the token budget is what stops us,
+        # not a document count, so we never cut mid-target on doc count.
+        source = iter_hf_text(repo=args.hf_repo, configs=cfgs,
+                              max_docs=None, seed=args.seed)
+
     out_dir = Path(args.out)
     writer = ShardWriter(out_dir, tokens_per_shard=args.tokens_per_shard,
                          prefix=args.prefix)
 
-    # Buffer documents so encoding can run batched.
+    budget = args.max_tokens or 0
+    if budget:
+        print(f"[retok] token budget: {budget:,} "
+              f"(~{budget/1e9:.2f}B) -- stopping when reached", flush=True)
+
     buf: List[str] = []
     n_seen = 0
-    for doc in iter_text_files(args.files):
+    stop = False
+    for doc in source:
         if not doc.strip():
             continue
         buf.append(doc)
         n_seen += 1
         if len(buf) >= args.encode_batch:
-            _flush_docs(tok, buf, eos_id, writer, n_seen)
+            _flush_docs(tok, buf, eos_id, writer, n_seen, budget)
             buf = []
-            if args.max_docs and n_seen >= args.max_docs:
+            if writer.total_tokens >= budget or (args.max_docs and n_seen >= args.max_docs):
+                stop = True
                 break
-    if buf and not (args.max_docs and n_seen >= args.max_docs):
-        _flush_docs(tok, buf, eos_id, writer, n_seen)
+    if buf and not stop:
+        _flush_docs(tok, buf, eos_id, writer, n_seen, budget)
 
     writer.close()
+    if budget:
+        pct = 100.0 * writer.total_tokens / budget
+        print(f"[retok] token budget used: {writer.total_tokens:,} / {budget:,} "
+              f"({pct:.1f}%)", flush=True)
 
 
-def _flush_docs(tok, docs: List[str], eos_id: int, writer: ShardWriter, seen: int) -> None:
+def _flush_docs(tok, docs: List[str], eos_id: int, writer: ShardWriter,
+                seen: int, budget: int = 0) -> None:
     for ids in batch_encode(tok, docs):
         writer.add_doc(ids, eos_id)      # one doc + its EOS boundary
     if seen % 20_000 < len(docs):
@@ -160,13 +183,24 @@ def _eos_id(tok_dir: Path, tok: Tokenizer) -> int:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("files", nargs="+", help="raw corpus paths (jsonl/txt/parquet) or dirs")
+    p.add_argument("files", nargs="*", help="raw corpus paths (jsonl/txt/parquet) or dirs")
     p.add_argument("--tokenizer", required=True, help="path to the trained tokenizer dir")
     p.add_argument("--out", required=True, help="output dir for .bin shards")
     p.add_argument("--tokens-per-shard", type=int, default=100_000_000)
     p.add_argument("--encode-batch", type=int, default=1000, help="docs per encode batch")
     p.add_argument("--prefix", default="shard")
     p.add_argument("--max-docs", type=int, default=0, help="0 = all")
+
+    # -- token budget + Hub streaming ------------------------------------
+    p.add_argument("--max-tokens", type=int, default=0,
+                   help="stop once this many tokens are written (0 = no limit). "
+                        "Use this to cut the corpus at exactly 2B tokens.")
+    p.add_argument("--hf-repo", default=None,
+                   help="stream a Hub dataset instead of local files "
+                        "(e.g. HuggingFaceTB/smollm-corpus)")
+    p.add_argument("--hf-configs", nargs="*", default=None,
+                   help="configs to stream; default cosmopedia-v2 + fineweb-edu-dedup")
+    p.add_argument("--seed", type=int, default=42, help="shuffle seed for Hub streaming")
     return p.parse_args(argv)
 
 

@@ -27,48 +27,60 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
-class Lion(torch.optim.Optimizer):
-    """LION optimizer — only stores momentum (half the VRAM of AdamW).
+def build_optimizer(model, args):
+    """AdamW with decoupled weight decay, param groups, and no WD on 1-D params.
 
-    Paper: https://arxiv.org/abs/2302.06675
-    Recommended: lr 3-10x smaller than AdamW, betas=(0.9, 0.99)
+    Why AdamW and not Lion: Lion halves optimizer state but its update is
+    `sign(momentum)`, which throws away gradient magnitude. For a 2B-token run
+    on a 50M model AdamW's per-parameter scaling is the better-behaved default,
+    and the 2x state cost is irrelevant here -- fp32 moments for 49.5M params
+    is ~400MB against 24GB of VRAM.
+
+    Three settings that matter, and are easy to get wrong:
+
+    1. `decoupled_weight_decay=True`. Folding L2 into the gradient biases the
+       effective LR per parameter; the decoupled form is what weight_decay=0.1
+       actually means and it behaves correctly alongside the no-decay group.
+
+    2. No weight decay on 1-D params (norm gains). Decaying a gain vector
+       pulls it toward zero, fighting the RMSNorm rescale. Standard practice
+       (GPT-2 / LLaMA) and very easy to miss.
+
+    3. `fused=True`. The fused CUDA kernel runs the whole update in one pass
+       with no per-parameter Python loop -- a real win across ~130 tensors.
+       Falls back automatically on CPU.
     """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or name.endswith("bias"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
 
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.999), weight_decay=0.0):
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
-        super().__init__(params, defaults)
+    groups = [
+        {"params": decay, "weight_decay": args.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+    kwargs = dict(lr=args.lr, betas=(args.beta1, args.beta2), eps=1e-8)
+    fused = bool(getattr(args, "fused_adamw", True)) and torch.cuda.is_available()
+    if fused:
+        kwargs["fused"] = True
 
-        for group in self.param_groups:
-            lr = group["lr"]
-            beta1, beta2 = group["betas"]
-            wd = group["weight_decay"]
+    optim = torch.optim.AdamW(groups, **kwargs)
 
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
+    n_dec = sum(p.numel() for p in decay)
+    n_nod = sum(p.numel() for p in no_decay)
+    print(f"[pretrain] optimizer: {'AdamW (fused)' if fused else 'AdamW'} "
+          f"betas=({args.beta1},{args.beta2}) eps=1e-8", flush=True)
+    print(f"[pretrain]   decay    {n_dec/1e6:7.1f}M  wd={args.weight_decay}", flush=True)
+    print(f"[pretrain]   no_decay {n_nod/1e6:7.1f}M  wd=0.0 (norm gains)", flush=True)
+    print(f"[pretrain]   state ~{(n_dec+n_nod)*8/1e9:.2f} GB fp32 moments", flush=True)
+    return optim
 
-                grad = p.grad
-                if wd != 0:
-                    p.mul_(1 - lr * wd)
 
-                # State: just momentum
-                state = self.state[p]
-                if len(state) == 0:
-                    state["exp_avg"] = torch.zeros_like(p)
-
-                exp_avg = state["exp_avg"]
-                update = exp_avg.mul(beta1).add(grad, alpha=1 - beta1)
-                p.add_(update.sign(), alpha=-lr)
-                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
-
-        return loss
 
 # Trackio for monitoring
 try:
@@ -110,17 +122,94 @@ def parse_args():
     p.add_argument("--compile", action="store_true", default=None)
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--no-resume", action="store_true", help="Start fresh, ignore existing checkpoints")
+    p.add_argument("--no-fused-adamw", dest="fused_adamw", action="store_false", default=None,
+                   help="Disable the fused AdamW CUDA kernel")
+    p.add_argument("--auto-batch", action="store_true", default=None,
+                   help="Probe the GPU for the largest batch that fits, then set "
+                        "grad_accum to hit --target-batch tokens")
+    p.add_argument("--target-batch", type=int, default=None,
+                   help="effective batch (in sequences) to hold constant when "
+                        "--auto-batch picks the per-device batch")
+    p.add_argument("--val-every", type=int, default=None,
+                   help="Run validation every N steps (0 disables)")
+    p.add_argument("--val-tokens", type=int, default=None,
+                   help="Tokens to use for each validation pass")
     return p.parse_args()
 
 
-# Defaults tuned for RTX 5090 Blackwell (32GB VRAM) — Lion optimizer
+# ──────────────────────────────────────────────────────────────────────
+# Auto batch sizing
+# ──────────────────────────────────────────────────────────────────────
+def _vram_gb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+
+def find_max_batch(build_step, params, block: int, cap: int = 256) -> tuple:
+    """Binary-search the largest per-device batch that completes a fwd+bwd step.
+
+    `build_step(bs)` must return a scalar loss for a batch of `bs` sequences.
+    An OOM is caught and treated as data rather than a crash, and
+    `empty_cache()` runs between probes -- a fragmented allocation would
+    otherwise make a size that actually fits look like a failure.
+
+    Returns (best_batch, log_lines). Returns 0 if even batch=1 OOMs, which
+    means --block is too long for this card.
+    """
+    log = [f"probing batch 1..{cap} at block={block} on "
+           f"{torch.cuda.get_device_name(0)} ({_vram_gb():.1f} GB)"]
+
+    def fits(bs: int) -> bool:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            loss = build_step(bs)
+            loss.backward()
+            ok = bool(torch.isfinite(loss).item())
+            del loss
+            return ok
+        except torch.cuda.OutOfMemoryError:
+            return False
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                return False
+            raise
+        finally:
+            for p in params:
+                p.grad = None
+            torch.cuda.empty_cache()
+
+    if not fits(1):
+        log.append("  batch=1 FAILED -- lower --block or free VRAM")
+        return 0, log
+
+    lo, hi, best = 2, cap, 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+
+    peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    log.append(f"  max batch that fits: {best}  (peak {peak:.1f} GB of "
+               f"{_vram_gb():.1f} GB)")
+    return best, log
+
+
+# Defaults tuned for a 24GB card (RTX 4090) with fused AdamW.
+# 2B tokens at block=2048, effective batch 32 sequences => 65,536 tok/step
+# => 30,517 steps. batch/grad_accum are placeholders; --auto-batch overrides.
 DEFAULTS = dict(
-    steps=76000, warmup=1000, lr=3e-4, min_lr=3e-5, weight_decay=0.1,
-    beta1=0.9, beta2=0.99, grad_clip=1.0, batch=8, grad_accum=4,
+    steps=30517, warmup=305, lr=6e-4, min_lr=6e-5, weight_decay=0.1,
+    beta1=0.9, beta2=0.95, grad_clip=1.0, batch=4, grad_accum=8,
     block=2048, seed=42, shards=None, hub_repo="VTXAI/vortex-50m",
     trackio_space="VTXAI/vortex-50m-trackio", trackio_project="vortex-50m",
     push_every=3000, token=None, log_every=25, save_dir="/tmp/vortex_50m_ckpt",
     compile=True, arch="vortex-50m", tokenizer=None, rope_theta=None,
+    fused_adamw=True, auto_batch=True, target_batch=32,
+    val_every=500, val_tokens=2_000_000,
 )
 
 
@@ -376,23 +465,59 @@ def main():
         else:
             print(f"[pretrain] WARN: no C compiler found, disabling torch.compile", flush=True)
 
+    # ── Auto batch sizing ──────────────────────────────────────────────
+    # Runs BEFORE the optimizer so the probe's gradients/state never mix with
+    # training state, and before torch.compile so a probe compile is not paid
+    # for twice. The largest batch that fits is the fastest per-token option;
+    # grad_accum then tops the effective batch back up to the target.
+    if args.auto_batch and torch.cuda.is_available() and not resume:
+        probe_model = model
+        probe_model.gradient_checkpointing_enable()
+        params = [p for p in probe_model.parameters() if p.requires_grad]
+
+        def build_probe_step(bs: int):
+            ids = torch.randint(0, arch.vocab_size, (bs, args.block), device=device)
+            tgt = torch.randint(0, arch.vocab_size, (bs, args.block), device=device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = probe_model(input_ids=ids, labels=tgt, chunk_size=1024)
+                return out.loss / bs
+
+        print(f"[pretrain] auto-batch: probing {torch.cuda.get_device_name(0)} "
+              f"({_vram_gb():.1f} GB)...", flush=True)
+        best, log = find_max_batch(build_probe_step, params, args.block)
+        for line in log:
+            print(f"[pretrain] {line}", flush=True)
+
+        if best == 0:
+            print(f"[pretrain] ERROR: cannot fit batch=1 at block={args.block}. "
+                  f"Lower --block.", flush=True)
+            sys.exit(1)
+
+        # Leave headroom: probing to the exact ceiling leaves no margin for a
+        # longer document, allocator fragmentation, or Trackio. 90% of the
+        # discovered max is the largest size that stays reliably stable.
+        chosen = max(1, int(best * 0.9))
+        accum = max(1, args.target_batch // chosen)
+        if chosen * accum != args.target_batch:
+            print(f"[pretrain] note: target_batch={args.target_batch} is not a "
+                  f"multiple of batch={chosen}; using "
+                  f"{chosen * accum} sequences/step", flush=True)
+        args.batch, args.grad_accum = chosen, accum
+        print(f"[pretrain] auto-batch -> batch={chosen} x grad_accum={accum} "
+              f"= {chosen * accum} seq/step "
+              f"({chosen * accum * args.block:,} tok/step)", flush=True)
+
+        # Reclaim everything the probe allocated.
+        for p in params:
+            p.grad = None
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    elif args.auto_batch:
+        print(f"[pretrain] auto-batch skipped "
+              f"({'no CUDA' if not torch.cuda.is_available() else 'resuming'})", flush=True)
+
     # ── Optimizer ──────────────────────────────────────────────────────
-    decay, no_decay = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim < 2 or name.endswith("bias") or "norm" in name or "embed" in name:
-            no_decay.append(p)
-        else:
-            decay.append(p)
-    optim = Lion(
-        [
-            {"params": decay, "weight_decay": args.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=args.lr, betas=(args.beta1, args.beta2),
-    )
-    print(f"[pretrain] optimizer: Lion (1 state, ~50% VRAM vs AdamW), decay={sum(p.numel() for p in decay)/1e6:.1f}M no_decay={sum(p.numel() for p in no_decay)/1e6:.1f}M", flush=True)
+    optim = build_optimizer(model, args)
 
     # Load optimizer/RNG state if resuming
     start_step = 0
@@ -403,6 +528,46 @@ def main():
     # Enable gradient checkpointing to save VRAM (~40% less activation memory)
     model.gradient_checkpointing_enable()
     print(f"[pretrain] gradient checkpointing enabled", flush=True)
+
+    # ── Held-out validation split (the overfit guard) ──────────────────
+    # A 50M model on 2B tokens (~40 epochs of a Chinchilla-optimal budget) can
+    # memorize. Holding out the tail of the corpus gives a held-out loss curve;
+    # if train loss keeps falling while val loss rises, that is overfitting and
+    # the run is wasting the rest of its budget.
+    val_it = None
+    if args.val_every and ds.total_tokens > args.block * 100:
+        import numpy as np
+
+        n_val_blocks = max(args.batch, min(64, args.val_tokens // args.block))
+        # Draw from the END of the stream; training samples randomly across all
+        # shards, so the tail is the least likely to have been seen.
+        val_rng = np.random.default_rng(args.seed + 999)
+        val_blocks = []
+        for _ in range(n_val_blocks):
+            start = int(val_rng.integers(ds.total_tokens - args.block * 2,
+                                         ds.total_tokens - args.block - 2))
+            mm, local = ds._locate(start)
+            val_blocks.append(torch.from_numpy(
+                np.asarray(mm[local:local + args.block + 1], dtype=np.int64)))
+        val_batches = [
+            torch.stack(val_blocks[i:i + args.batch])
+            for i in range(0, len(val_blocks) - args.batch + 1, args.batch)
+        ]
+        if val_batches:
+            val_it = iter(val_batches)
+            n_val_tok = len(val_batches) * args.batch * args.block
+            print(f"[pretrain] validation: {len(val_batches)} held-out batches "
+                  f"x {args.batch} x {args.block} = {n_val_tok:,} tokens "
+                  f"(every {args.val_every} steps)", flush=True)
+            # Guard against a pathological config: fewer than 8 batches makes
+            # the val loss too noisy to read a trend from.
+            if len(val_batches) < 8:
+                print(f"[pretrain] WARNING: only {len(val_batches)} val batches; "
+                      f"raise --val-tokens for a readable val curve", flush=True)
+        else:
+            print(f"[pretrain] validation disabled (corpus too small)", flush=True)
+    else:
+        print(f"[pretrain] validation disabled", flush=True)
 
     # ── Train ──────────────────────────────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
@@ -416,6 +581,9 @@ def main():
 
     model.train()
     losses = []
+    val_history = []          # (step, train_loss, val_loss)
+    best_val = float("inf")
+    overfit_strikes = 0
     t0 = time.time()
     steps_this_run = 0
     for step in range(start_step, args.steps):
@@ -463,6 +631,48 @@ def main():
                     "tokens": (step + 1) * tok_per_step,
                 })
 
+        # ── Validation + overfit detection ──────────────────────────────
+        if val_it is not None and args.val_every and (step + 1) % args.val_every == 0:
+            model.eval()
+            vloss, nb = 0.0, 0
+            with torch.no_grad():
+                for vb in val_batches:
+                    v_in = vb[:, :-1].to(device, non_blocking=True)
+                    v_tg = vb[:, 1:].to(device, non_blocking=True)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        vloss += model(input_ids=v_in, labels=v_tg,
+                                       chunk_size=1024).loss.item()
+                    nb += 1
+            val_loss = vloss / max(1, nb)
+            t_avg = sum(losses[-args.val_every:]) / max(1, len(losses[-args.val_every:]))
+            gap = t_avg - val_loss
+            val_history.append((step + 1, t_avg, val_loss))
+            print(f"[pretrain] step {step+1}  train={t_avg:.4f}  val={val_loss:.4f}  "
+                  f"gap={gap:+.4f}  ppl_val={math.exp(min(20, val_loss)):.1f}", flush=True)
+            if HAS_TRACKIO and os.environ.get("TRACKIO_SPACE_ID"):
+                trackio.log({"step": step + 1, "val_loss": val_loss,
+                             "train_val_gap": gap})
+
+            if val_loss < best_val:
+                best_val = val_loss
+                overfit_strikes = 0
+            else:
+                overfit_strikes += 1
+
+            # Overfitting: train loss falling while held-out loss does not.
+            # 3 consecutive non-improvements past the halfway point is a
+            # strong signal that the remaining budget would be wasted.
+            if overfit_strikes >= 3 and (step + 1) > args.steps * 0.5:
+                print(f"[pretrain] WARNING: val loss has not improved for "
+                      f"{overfit_strikes} checks (best {best_val:.4f}, "
+                      f"now {val_loss:.4f}) past 50%% of training.", flush=True)
+                print(f"[pretrain]          The model is likely overfitting "
+                      f"{args.steps * tok_per_step / 1e9:.2f}B tokens for a "
+                      f"{n/1e6:.1f}M model.", flush=True)
+                print(f"[pretrain]          Consider: fewer steps, more data, "
+                      f"or a smaller model. Continuing to step {args.steps}.", flush=True)
+            model.train()
+
         if (step + 1) % args.push_every == 0 or (step + 1) == args.steps:
             ckpt = save_checkpoint(model, optim, step + 1, args, losses)
             if HAS_TRACKIO and os.environ.get("TRACKIO_SPACE_ID"):
@@ -477,6 +687,34 @@ def main():
                 print(f"[pretrain] pushed to {args.hub_repo}", flush=True)
 
     print(f"[pretrain] DONE: {args.steps} steps in {(time.time()-t0)/60:.1f} min", flush=True)
+    print(f"[pretrain] final train loss: {sum(losses[-100:])/max(1,len(losses[-100:])):.4f} "
+          f"(avg last 100)", flush=True)
+    print(f"[pretrain] tokens seen: {args.steps * tok_per_step / 1e9:.2f}B", flush=True)
+
+    if val_history:
+        print("\n" + "=" * 64)
+        print("TRAIN / VALIDATION CURVE  (overfit check)")
+        print("=" * 64)
+        print(f"{'step':>8} {'train':>9} {'val':>9} {'gap':>8} {'val ppl':>9}")
+        for st, tr, vl in val_history:
+            print(f"{st:>8} {tr:>9.4f} {vl:>9.4f} {tr - vl:>+8.4f} "
+                  f"{math.exp(min(20, vl)):>9.1f}")
+        print("-" * 64)
+        best_st, _, best_vl = min(val_history, key=lambda r: r[2])
+        last_gap = val_history[-1][1] - val_history[-1][2]
+        print(f"best val    {best_vl:.4f} at step {best_st}")
+        print(f"final gap   {last_gap:+.4f}  (train - val)")
+        if last_gap < -0.02:
+            print("VERDICT     OVERFITTING -- val loss is below train loss, which")
+            print("            means the held-out split leaked or the LR is too")
+            print("            high late in the schedule. Reduce steps or add data.")
+        elif last_gap > 0.15:
+            print("VERDICT     generalising, but a widening gap -- monitor; if it")
+            print("            keeps growing the run will eventually memorize.")
+        else:
+            print("VERDICT     healthy -- train and val are tracking together.")
+        print("=" * 64 + "\n")
+
     if HAS_TRACKIO and os.environ.get("TRACKIO_SPACE_ID"):
         trackio.finish()
 
