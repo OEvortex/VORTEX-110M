@@ -1,0 +1,57 @@
+{
+  "checkpoint": "VTXAI/vortex-50m",
+  "base_model": "VTXAI/vortex-50m-16k",
+  "domain": "Cybersecurity & Cryptography Specialist",
+  "dataset": "VTXAI/cyber-crypto-qa-50k",
+  "architecture": {
+    "name_or_path": "VTXAI/vortex-50m",
+    "params_total": 49846528,
+    "params_budget": 50000000,
+    "within_budget": true,
+    "hidden_size": 512,
+    "num_hidden_layers": 18,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "vocab_size": 16387,
+    "max_position_embeddings": 2048
+  },
+  "harness": "lm-evaluation-harness",
+  "tasks": {
+    "hellaswag": {
+      "primary_metric": "acc_norm",
+      "score": 0.2709619597689703,
+      "acc": 0.264389563831906,
+      "acc_norm": 0.2709619597689703,
+      "stderr": 0.004435481515909319
+    },
+    "arc_easy": {
+      "primary_metric": "acc_norm",
+      "score": 0.3362794612794613,
+      "acc": 0.3425925925925926,
+      "acc_norm": 0.3362794612794613,
+      "stderr": 0.0096941780727253
+    },
+    "piqa": {
+      "primary_metric": "acc_norm",
+      "score": 0.5478781284004353,
+      "acc": 0.5533188248095756,
+      "acc_norm": 0.5478781284004353,
+      "stderr": 0.011612217507379409
+    },
+    "winogrande": {
+      "primary_metric": "acc",
+      "score": 0.5146014206787688,
+      "acc": 0.5146014206787688,
+      "acc_norm": null,
+      "stderr": 0.014046492383275955
+    }
+  },
+  "wikitext103": {
+    "perplexity": 1394.3636394778187,
+    "mean_nll_nats": 7.2401934177598415,
+    "bits_per_byte": 10.445391138879039,
+    "n_tokens": 324862,
+    "n_scored": 324703
+  },
+  "scored_avg": 0.4174302425319089
+}

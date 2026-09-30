@@ -63,7 +63,7 @@ def load_model_and_tokenizer(ckpt, tok_arg, device):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
 
-    base_vocab = getattr(tok, "vocab_size", len(tok))
+    base_vocab = len(tok)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[eval] checkpoint : {ckpt}", flush=True)
     print(f"[eval] tokenizer  : {tok_src}", flush=True)
@@ -130,8 +130,7 @@ def wikitext_ppl(model, tok, n_lines, batch_size=8, device="cuda"):
     # `Salesforce/wikitext` is the canonical home of the corpus; the bare
     # `wikitext` alias now redirects to a repo whose script cannot be loaded
     # by current `datasets`. Both spellings have pointed at the same data.
-    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test",
-                      trust_remote_code=True)
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
 
     # WikiText is one row per line with blank lines between articles; joining
     # the non-empty rows of the first `n_lines` reproduces the article stream.

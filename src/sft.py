@@ -36,11 +36,12 @@ def normalize_messages(raw):
             return msgs
         return None
 
-    # Dolly-style: instruction / context -> response
+    # Dolly / Alpaca style: instruction / context / input -> response
     if isinstance(raw, dict) and raw.get("instruction"):
         instr = raw["instruction"]
-        if raw.get("context"):
-            instr = f"{instr}\n\n{raw['context']}"
+        extra = raw.get("context") or raw.get("input")
+        if extra:
+            instr = f"{instr}\n\n{extra}"
         resp = raw.get("response") or raw.get("output") or ""
         if not resp:
             return None
@@ -116,7 +117,7 @@ def collate(batch):
 # ──────────────────────────────────────────────────────────────────────
 def build_tokenizer(tok_dir):
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(tok_dir)
+    tok = AutoTokenizer.from_pretrained(tok_dir, trust_remote_code=True)
     return tok
 
 
@@ -195,6 +196,7 @@ def main():
     tok = build_tokenizer(args.tokenizer)
     n_before = len(tok)
     new_ids, im_end_id = add_chat_tokens(tok)
+    tok.chat_template = CT.build_chat_template()
     if args.tokenizer and not str(args.tokenizer).startswith((".", "/")):
         # Persist the chat-enabled tokenizer next to the SFT output so the
         # pushed model is loadable with the same control tokens.
@@ -248,7 +250,7 @@ def main():
     val_history = []
     best_val = float("inf")
     t0 = time.time()
-    log_every = max(1, steps // 40)
+    log_every = 5
 
     for step in range(start_step, steps):
         lr = cosine_lr(step, args.warmup, steps, args.lr, args.min_lr)

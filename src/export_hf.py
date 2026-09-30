@@ -159,8 +159,8 @@ def main():
 
         api = HfApi(token=os.environ.get("HF_TOKEN"))
         api.create_repo(args.push_to, private=args.private, exist_ok=True)
-        api.upload_folder(folder_id=args.push_to, folder_path=str(out),
-                          commit_message="Add HF configuration + modeling modules")  # ty:ignore[no-matching-overload]
+        api.upload_folder(repo_id=args.push_to, folder_path=str(out),
+                          commit_message="Add HF configuration + modeling modules")
         print(f"\n[export] pushed -> {args.push_to}")
         print(f"[export] load with:\n"
               f"           AutoModelForCausalLM.from_pretrained(\n"
